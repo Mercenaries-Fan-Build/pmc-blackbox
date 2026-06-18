@@ -12,9 +12,9 @@
 
 ## Installation
 
-1. Build `pmc_bb.dll` (see "Building from source" below), or download it from the [latest GitHub Release](https://github.com/austinkregel/mercs2-pmc-blackbox/releases).
+1. Build `pmc_bb.dll` (see "Building from source" below), or download it from the [latest GitHub Release](https://github.com/Mercenaries-Fan-Build/pmc-blackbox/releases).
 2. Copy `pmc_bb.dll` next to your `Mercenaries2.exe`.
-3. Use [mercs2-crack-game](https://github.com/austinkregel/mercs2-crack-game) to patch the EXE and inject this DLL into the import table.
+3. Use [mercs2-crack-game](https://github.com/Mercenaries-Fan-Build/mercs2-securom-bypass) to patch the EXE and inject this DLL into the import table.
 
 The game should now boot without SecuROM.
 
@@ -46,11 +46,9 @@ Output: `pmc_bb.dll` (~8–10 KB).
 
 This repository contains **only** the DLL and its build system. It does not include:
 
-- Python patching tools (SecuROM removal, EXE injection) — see [mercs2-crack-game](https://github.com/austinkregel/mercs2-crack-game) for that.
+- Python patching tools (SecuROM removal, EXE injection) — see [mercs2-securom-bypass](https://github.com/Mercenaries-Fan-Build/mercs2-securom-bypass) for that.
 - DLC compatibility patches or anim-table expansion — that belongs in a separate repo focused on DLC support.
-- Advanced debug probes (stream stall, pool drain, heap guard, fingerprinting) — kept in the main [mercenaries-game](https://github.com/austinkregel/mercenaries-game) repo.
 
 ## See also
 
-- [mercs2-crack-game](https://github.com/austinkregel/mercs2-crack-game) — Crack tool to patch Mercenaries2.exe and inject pmc_bb.dll into the import table.
-- [mercenaries-game](https://github.com/austinkregel/mercenaries-game) — Full reverse-engineering toolkit, including DLC porting and WAD analysis.
+- [mercs2-securom-bypass](https://github.com/Mercenaries-Fan-Build/mercs2-securom-bypass) — Crack tool to patch Mercenaries2.exe and inject pmc_bb.dll into the import table.
