@@ -315,6 +315,22 @@ __declspec(dllexport) int __stdcall BlackboxEntry(void) {
     return 1;
 }
 
+/* Whether the modkit asked for a verbose run. The Lua/engine log hook funnels
+ * every game log line through pmc_log() with a per-line disk flush, which is
+ * too costly for regular gameplay, so it is OFF by default and only armed when
+ * the launcher sets PMC_VERBOSE_LOG. Any value other than unset/empty/"0"/
+ * "false"/"no" counts as enabled; the crash handler is unaffected. */
+static BOOL VerboseLoggingRequested(void) {
+    char val[16];
+    DWORD n = GetEnvironmentVariableA("PMC_VERBOSE_LOG", val, sizeof(val));
+    if (n == 0) return FALSE;          /* unset or empty */
+    if (n >= sizeof(val)) return TRUE; /* set to a long value — treat as on */
+    if (lstrcmpiA(val, "0") == 0) return FALSE;
+    if (lstrcmpiA(val, "false") == 0) return FALSE;
+    if (lstrcmpiA(val, "no") == 0) return FALSE;
+    return TRUE;
+}
+
 /* --- DLL entry point --- */
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
@@ -336,10 +352,18 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         InstallCrashHandler();
 #endif
 
-        /* Lua log hooking — captures all game-level log events to
-         * pmc_blackbox.log for diagnostics. */
+        /* Lua/engine log hooking — captures all game-level log events to
+         * pmc_blackbox.log for diagnostics. This is the expensive path (a disk
+         * flush per logged line), so it is opt-in per launch: the modkit sets
+         * PMC_VERBOSE_LOG for a verbose run and leaves it unset for regular
+         * gameplay. The crash handler above is always armed regardless. */
 #ifndef PMC_DISABLE_LUA_LOG_HOOK
-        InstallLuaLogHook();
+        if (VerboseLoggingRequested()) {
+            InstallLuaLogHook();
+        } else {
+            pmc_log("blackbox", "Verbose log hook: OFF "
+                    "(set PMC_VERBOSE_LOG=1 for a verbose run)");
+        }
 #else
         pmc_log("blackbox", "Lua log hook: DISABLED at build time");
 #endif
