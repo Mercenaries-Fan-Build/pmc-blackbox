@@ -41,7 +41,7 @@
 #include "lua_log_hook.h"
 #include "crash_handler.h"
 
-#define PMC_BLACKBOX_VERSION "3.0.0"
+#define PMC_BLACKBOX_VERSION "3.1.0"
 #define SECUROM_XOR_KEY 0x19EA3FD3
 
 /* --- SecuROM event spoof --- */
