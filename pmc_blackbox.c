@@ -41,7 +41,7 @@
 #include "lua_log_hook.h"
 #include "crash_handler.h"
 
-#define PMC_BLACKBOX_VERSION "3.0.0"
+#define PMC_BLACKBOX_VERSION "3.1.0"
 #define SECUROM_XOR_KEY 0x19EA3FD3
 
 /* --- SecuROM event spoof --- */
@@ -68,6 +68,18 @@ volatile LONG g_logDropped = 0;
  * an early-init one. fflush per line is cheap for a debug logger and keeps the
  * crash-time tail truthful. Raise this only if log volume becomes a hot path. */
 #define LOG_FLUSH_THRESHOLD 1
+
+/* --- Live log subscribers (in-process passthrough) ---
+ * ASI plugins can subscribe to the captured log stream in real time (resolve
+ * pmc_log_subscribe via GetProcAddress) instead of tailing pmc_blackbox.log.
+ * Every pmc_log() line is fanned out to each sink. Sinks run under the log lock,
+ * so they MUST be fast and MUST NOT call pmc_log (re-entrant fan-out is guarded
+ * and skipped). */
+#define PMC_MAX_SINKS 8
+typedef void (*pmc_log_sink)(const char *line, void *ud);
+static struct { pmc_log_sink cb; void *ud; } g_sinks[PMC_MAX_SINKS];
+static int g_sinkCount = 0;
+static volatile LONG g_inFanout = 0;
 
 static void InitLogFile(void) {
     char exe_dir[MAX_PATH];
@@ -121,6 +133,14 @@ __declspec(dllexport) void pmc_log(const char *source, const char *fmt, ...) {
     if (g_logfile)
         fputs(line, g_logfile);
 
+    /* Fan out to live subscribers (in-process passthrough). Re-entrancy guarded
+     * so a sink that calls pmc_log() can't recurse the fan-out. */
+    if (g_sinkCount && InterlockedCompareExchange(&g_inFanout, 1, 0) == 0) {
+        int i;
+        for (i = 0; i < g_sinkCount; i++) g_sinks[i].cb(line, g_sinks[i].ud);
+        InterlockedExchange(&g_inFanout, 0);
+    }
+
     if (InterlockedIncrement(&g_logPending) >= LOG_FLUSH_THRESHOLD) {
         fflush(stdout);
         if (g_logfile) fflush(g_logfile);
@@ -136,6 +156,30 @@ __declspec(dllexport) void pmc_log_flush(void) {
     if (g_logfile) fflush(g_logfile);
     InterlockedExchange(&g_logPending, 0);
     LeaveCriticalSection(&g_logLock);
+}
+
+/**
+ * Subscribe to the live log stream. `cb(line, ud)` is invoked for every
+ * pmc_log() line (already timestamped + source-tagged, NUL-terminated, with a
+ * trailing '\n'), in real time and in-process — no file tail, no PMC_VERBOSE_LOG
+ * required (world-load milestones flow even in the default markers-only mode).
+ *
+ * The callback runs under the log lock: keep it fast and DO NOT call pmc_log()
+ * from it. Returns 1 on success, 0 if cb is NULL or the sink table is full.
+ * ASI plugins resolve this at runtime via GetProcAddress("pmc_log_subscribe").
+ */
+__declspec(dllexport) int pmc_log_subscribe(pmc_log_sink cb, void *ud) {
+    int ok = 0;
+    if (!cb) return 0;
+    EnterCriticalSection(&g_logLock);
+    if (g_sinkCount < PMC_MAX_SINKS) {
+        g_sinks[g_sinkCount].cb = cb;
+        g_sinks[g_sinkCount].ud = ud;
+        g_sinkCount++;
+        ok = 1;
+    }
+    LeaveCriticalSection(&g_logLock);
+    return ok;
 }
 
 /* --- Debug console --- */
@@ -315,11 +359,11 @@ __declspec(dllexport) int __stdcall BlackboxEntry(void) {
     return 1;
 }
 
-/* Whether the modkit asked for a verbose run. The Lua/engine log hook funnels
- * every game log line through pmc_log() with a per-line disk flush, which is
- * too costly for regular gameplay, so it is OFF by default and only armed when
- * the launcher sets PMC_VERBOSE_LOG. Any value other than unset/empty/"0"/
- * "false"/"no" counts as enabled; the crash handler is unaffected. */
+/* Whether the modkit asked for a verbose run. The Lua/engine log hook is always
+ * installed (markers-only — cheap), but emitting EVERY line funnels each through
+ * pmc_log() with a per-line disk flush, too costly for regular gameplay — so the
+ * full firehose is opt-in via PMC_VERBOSE_LOG. Any value other than unset/empty/
+ * "0"/"false"/"no" counts as enabled; the crash handler is unaffected. */
 static BOOL VerboseLoggingRequested(void) {
     char val[16];
     DWORD n = GetEnvironmentVariableA("PMC_VERBOSE_LOG", val, sizeof(val));
@@ -352,17 +396,19 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         InstallCrashHandler();
 #endif
 
-        /* Lua/engine log hooking — captures all game-level log events to
-         * pmc_blackbox.log for diagnostics. This is the expensive path (a disk
-         * flush per logged line), so it is opt-in per launch: the modkit sets
-         * PMC_VERBOSE_LOG for a verbose run and leaves it unset for regular
-         * gameplay. The crash handler above is always armed regardless. */
+        /* Lua/engine log hooking — captures the game's stripped-out log stream.
+         * Installed in markers-only mode by default: only world-load milestones
+         * are emitted (a cheap substring scan, no per-line disk flush), so load
+         * visibility stays on at near-zero cost. PMC_VERBOSE_LOG=1 upgrades it to
+         * the full firehose (every line + @script:line; one disk flush per line —
+         * costly, for diagnostics). The crash handler above is always armed. */
 #ifndef PMC_DISABLE_LUA_LOG_HOOK
-        if (VerboseLoggingRequested()) {
-            InstallLuaLogHook();
-        } else {
-            pmc_log("blackbox", "Verbose log hook: OFF "
-                    "(set PMC_VERBOSE_LOG=1 for a verbose run)");
+        {
+            int verbose = VerboseLoggingRequested();
+            InstallLuaLogHook(verbose);
+            pmc_log("blackbox", "Lua log hook: %s",
+                    verbose ? "VERBOSE (every line; PMC_VERBOSE_LOG set)"
+                            : "markers-only (load milestones; PMC_VERBOSE_LOG=1 for every line)");
         }
 #else
         pmc_log("blackbox", "Lua log hook: DISABLED at build time");
