@@ -6,3 +6,4 @@ EXPORTS
     BlackboxEntry @1
     pmc_log
     pmc_log_flush
+    pmc_log_subscribe

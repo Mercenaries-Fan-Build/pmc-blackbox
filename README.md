@@ -7,7 +7,7 @@
 - **SecuROM v7 spoof:** Creates the required `v7_XXXX` event so the game can boot without retail media or SecuROM running.
 - **Debug console:** Allocates a Windows console window and logs all game output (including Lua prints).
 - **Crash handler:** Logs exception info, registers, and call stack on a crash for easier diagnostics.
-- **Lua logging hooks:** Captures all game-level log events to `pmc_blackbox.log` for forensics (world-load markers, errors, etc.).
+- **Lua logging hooks:** Captures the game's stripped-out log stream. Runs in **markers-only** mode by default — only world-load milestones are emitted (a cheap substring scan, no per-line disk flush), so load-progress visibility stays on at near-zero cost. Set `PMC_VERBOSE_LOG=1` for the full per-line firehose (every line + `@script:line`; costly, for diagnostics). Output goes to the console + `pmc_blackbox.log`, and live to subscribers (see `pmc_log_subscribe`).
 - **ASI loader:** Discovers and loads all `.asi` plugins from `scripts/`, `plugins/`, `update/`, and the game root — replacing the need for a separate ASI loader DLL.
 
 ## Installation
@@ -41,6 +41,7 @@ Output: `pmc_bb.dll` (~8–10 KB).
 - **`BlackboxEntry` (ordinal #1):** The game's import table resolves this by ordinal. Callable but a no-op; real work happens in `DllMain`.
 - **`pmc_log(source, fmt, ...)`:** Exported by name. ASI plugins resolve this at runtime via `GetProcAddress("pmc_log")` and use it for centralized logging.
 - **`pmc_log_flush()`:** Explicit log flush for crash-survivable checkpoints.
+- **`pmc_log_subscribe(cb, ud)`:** Subscribe to the live log stream in-process (resolve via `GetProcAddress`). `cb(line, ud)` fires for every log line in real time — no file tail, no `PMC_VERBOSE_LOG` required (world-load milestones flow even in markers-only mode). The callback runs under the log lock: keep it fast and do not call `pmc_log` from it. Lets a mod react to load progress (e.g. detect "now in-game") without reading the log file.
 
 ## Scope
 
