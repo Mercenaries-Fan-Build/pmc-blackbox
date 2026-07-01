@@ -76,10 +76,6 @@ typedef struct { DWORD value; DWORD tt; } LuaTValue;
 
 static volatile LONG g_inPrintHook = 0;
 
-/* 0 = markers-only (emit only world-load milestones, no per-line cost);
- * 1 = verbose (emit every captured line + its @script:line). Set by install. */
-static int g_verboseLog = 0;
-
 /* --- Safe memory access (precache print() can pass bad pointers) --- */
 
 /* Bytes safely readable starting at p, within its single committed region.
@@ -207,12 +203,11 @@ static BOOL ResolvePrintStack(lua_State *L, LuaTValue **out_top,
 
 /* --- World-load milestone tagging ---
  *
- * The point of this hook is to SEE load progress. High-signal substrings are
- * echoed under the "world" source so milestones are trivially greppable AND so
- * consumers (e.g. the mercs2-qol-mods m2_loadtrigger ladder) can react to them
- * live without the full firehose. In the default markers-only mode this is the
- * ONLY thing emitted, which is what keeps load visibility on at near-zero cost
- * (a cheap substring scan per line; nothing written unless it matches).
+ * The point of this hook is to SEE load progress. On top of the per-line [lua]
+ * capture, high-signal substrings are also echoed under the "world" source so
+ * milestones are trivially greppable and consumers (e.g. the mercs2-qol-mods
+ * m2_loadtrigger ladder) can react to them. This runs only when the hook is
+ * installed, i.e. a PMC_VERBOSE_LOG diagnostic run.
  *
  * The list mirrors loadprobe's world-load ladder (the single source of truth in
  * mercs2-qol-mods/sdk/m2/load_ladder.gen.h) — keep them roughly in sync. Generic
@@ -415,10 +410,9 @@ static int Hook_LogPrintf(lua_State *L) {
     }
     buf[pos] = '\0';
 
-    if (g_verboseLog) {
-        /* Verbose only: append the Lua call site ("@script:line") and emit every
-         * line. The caller-walk is the costly part and milestones don't need it,
-         * so markers-only mode skips both this and the per-line pmc_log(). */
+    /* Append the Lua call site ("@script:line") so bare values are no longer
+     * context-free. Best-effort: skipped silently if the frame doesn't resolve. */
+    {
         char loc[300];
         int ll = ResolveCallerLoc(L, loc, (int)sizeof(loc));
         if (ll > 0 && pos + ll < (int)sizeof(buf) - 1) {
@@ -426,12 +420,10 @@ static int Hook_LogPrintf(lua_State *L) {
             pos += ll;
             buf[pos] = '\0';
         }
-        pmc_log("lua", "%s", buf);
     }
 
-    /* Always emit world-load milestones (cheap substring scan; nothing is written
-     * unless a marker matches). This is the markers-only path that keeps load
-     * visibility on without the verbose per-line disk cost. */
+    pmc_log("lua", "%s", buf);
+    /* Echo world-load milestones under the "world" source so they're greppable. */
     MaybeTagMilestone(buf);
 
     InterlockedExchange(&g_inPrintHook, 0);
@@ -451,10 +443,8 @@ static int Hook_LogPrintf(lua_State *L) {
 
 static lua_CFunction g_origStub = NULL;  /* MinHook trampoline (unused no-op) */
 
-int InstallLuaLogHook(int verbose) {
+int InstallLuaLogHook(void) {
     MH_STATUS st;
-
-    g_verboseLog = verbose;
 
     /* Already initialized by InstallCompatHooks; init defensively for the
      * PMC_NO_COMPAT_HOOKS control build. */
@@ -483,8 +473,8 @@ int InstallLuaLogHook(int verbose) {
     }
 
     pmc_log("lualog", "Stripped-log capture installed: MinHook @0x%08X (shared "
-            "print/Debug.Printf/subsystem stub), mode=%s. Watch sources [lua]/[world].",
-            VA_PRINT_STUB, g_verboseLog ? "verbose" : "markers-only");
+            "print/Debug.Printf/subsystem stub). Watch sources [lua]/[world].",
+            VA_PRINT_STUB);
     pmc_log_flush();  /* crash-survivable: this line on disk == install completed */
     return 1;
 }

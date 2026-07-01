@@ -19,15 +19,12 @@
  * Call once from DllMain AFTER InstallCompatHooks() (MinHook init + pmc_log)
  * and BEFORE LoadASIPlugins(). No .rdata writes.
  *
- * `verbose`:
- *   0 = markers-only (default): each captured line is matched against the
- *       world-load milestone list and ONLY matches are emitted (via pmc_log).
- *       The expensive per-line @script:line caller-walk is skipped and nothing
- *       is written for non-marker lines, so this is cheap enough to leave on —
- *       it gives always-on load-phase visibility without the verbose disk cost.
- *   1 = verbose: every captured line is emitted with its @script:line location
- *       (the original firehose; one disk flush per line — costly).
+ * The hook detours the game's hot shared log stub and runs per-call stack
+ * resolution + formatting on every funneled call, so it is installed ONLY for a
+ * diagnostic run (the caller gates this behind PMC_VERBOSE_LOG). Every captured
+ * line is emitted with its @script:line location; world-load milestones are also
+ * echoed under the "world" source.
  *
  * Returns 1 on success, 0 on failure (logged).
  */
-int InstallLuaLogHook(int verbose);
+int InstallLuaLogHook(void);
