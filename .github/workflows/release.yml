@@ -12,6 +12,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # full history + tags so `git describe` works on manual runs
 
       - name: Install MinGW
         run: |
@@ -19,7 +21,10 @@ jobs:
           sudo apt-get install -y gcc-mingw-w64-i686
 
       - name: Build pmc_bb.dll
-        run: make mingw
+        # Stamp the DLL with the exact release tag (github.ref_name is e.g. v0.4.0
+        # on a tag push). For manual workflow_dispatch runs off a branch, fall back
+        # to the Makefile's git-describe default.
+        run: make mingw ${{ github.ref_type == 'tag' && format('VERSION={0}', github.ref_name) || '' }}
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2

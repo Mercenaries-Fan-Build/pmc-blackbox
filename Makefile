@@ -17,6 +17,12 @@ CC_MSVC     = cl
 TARGET      = pmc_bb.dll
 DEF         = pmc_blackbox.def
 
+# --- Version stamped into the DLL banner ---
+# Defaults to the current git tag (e.g. v0.4.0, or v0.4.0-2-gabc123-dirty between
+# tags). CI overrides it with the exact release tag: `make mingw VERSION=v0.4.0`.
+# `?=` so an explicit `make VERSION=...` wins over the git-derived default.
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
+
 # --- MinHook paths (local copy) ---
 MINHOOK_INC  = ./minhook
 MINHOOK_SRC  = ./minhook
@@ -31,7 +37,11 @@ SRCS_MH     = $(MINHOOK_SRC)/hook.c \
 SRCS_ALL    = $(SRCS_BB) $(SRCS_MH)
 
 EXTRA_CFLAGS =
-CFLAGS      = -O2 -Wall -Wno-unused-function -I$(MINHOOK_INC) -shared -Wl,--enable-stdcall-fixup $(EXTRA_CFLAGS)
+# Strip a leading "v" from the tag (v0.4.0 -> 0.4.0) so the banner "v%s" reads
+# "v0.4.0" rather than "vv0.4.0".
+VERSION_STR  = $(VERSION:v%=%)
+VERSION_DEF  = -DPMC_BLACKBOX_VERSION='"$(VERSION_STR)"'
+CFLAGS      = -O2 -Wall -Wno-unused-function -I$(MINHOOK_INC) -shared -Wl,--enable-stdcall-fixup $(VERSION_DEF) $(EXTRA_CFLAGS)
 LDFLAGS     = -lkernel32 -luser32
 
 .PHONY: all clean mingw msvc help
@@ -41,12 +51,12 @@ all: mingw
 mingw: $(SRCS_BB) $(DEF)
 	$(CC_MINGW) $(CFLAGS) -o $(TARGET) $(SRCS_ALL) $(DEF) $(LDFLAGS)
 	-$(STRIP_MINGW) $(TARGET) 2>/dev/null || strip $(TARGET)
-	@echo "Built: $(TARGET) ($$(wc -c < $(TARGET)) bytes)"
+	@echo "Built: $(TARGET) v$(VERSION_STR) ($$(wc -c < $(TARGET)) bytes)"
 	@echo "Place next to Mercenaries2.exe (no separate MinHook DLL needed)"
 
 msvc: $(SRCS_BB) $(DEF)
-	$(CC_MSVC) /LD /O2 /GS- /I$(MINHOOK_INC) $(SRCS_ALL) /link /DEF:$(DEF) /OUT:$(TARGET) kernel32.lib user32.lib
-	@echo "Built: $(TARGET)"
+	$(CC_MSVC) /LD /O2 /GS- /I$(MINHOOK_INC) $(VERSION_DEF) $(SRCS_ALL) /link /DEF:$(DEF) /OUT:$(TARGET) kernel32.lib user32.lib
+	@echo "Built: $(TARGET) v$(VERSION_STR)"
 
 clean:
 	rm -f $(TARGET) pmc_blackbox.obj pmc_blackbox.exp pmc_blackbox.lib *.o

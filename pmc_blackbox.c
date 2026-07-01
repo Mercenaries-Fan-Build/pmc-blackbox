@@ -41,7 +41,13 @@
 #include "lua_log_hook.h"
 #include "crash_handler.h"
 
-#define PMC_BLACKBOX_VERSION "3.1.0"
+/* Version string embedded in the startup banner. The build injects the exact
+ * git tag via -DPMC_BLACKBOX_VERSION (see Makefile / release.yml) so the DLL
+ * always reports the version it was released as. The fallback below is only used
+ * for an ad-hoc build outside the Makefile (no -D, no git), never for a release. */
+#ifndef PMC_BLACKBOX_VERSION
+#define PMC_BLACKBOX_VERSION "0.0.0-dev"
+#endif
 #define SECUROM_XOR_KEY 0x19EA3FD3
 
 /* --- SecuROM event spoof --- */
