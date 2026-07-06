@@ -20,9 +20,44 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <string.h>
 
 extern void pmc_log(const char *source, const char *fmt, ...);
 extern void pmc_log_flush(void);
+
+/* Resolve `addr` to human-readable "module.dll+0xOFFSET" form in `buf`. This is
+ * what turns a bare faulting EIP (e.g. 6D982251) into "lua_trace.asi+0x2251" so
+ * nobody has to hand-subtract the module base to find WHERE it died. Returns a
+ * class the callers use to decide what to keep:
+ *   0 = not in any loaded module (buf set to "")
+ *   1 = application module  (Mercenaries2.exe, a .asi plugin, a game-dir dll)
+ *   2 = Windows system module (ntdll, kernel32, an nvidia/d3d dll, ...)
+ * Crash-safe: GetModuleHandleExA(FROM_ADDRESS|UNCHANGED_REFCOUNT) neither
+ * allocates nor faults on a wild pointer and takes no reference we must free. */
+static int resolve_addr(DWORD addr, char *buf, int buflen)
+{
+    HMODULE hmod = NULL;
+    char path[MAX_PATH], low[MAX_PATH];
+    const char *name = path, *p;
+    DWORD n;
+    int i, is_sys;
+    buf[0] = 0;
+    if (addr < 0x00010000UL) return 0;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)addr, &hmod) || !hmod)
+        return 0;
+    n = GetModuleFileNameA(hmod, path, sizeof(path));
+    if (!n) { wsprintfA(buf, "?+0x%lX", addr - (DWORD)hmod); return 1; }
+    for (p = path; *p; p++)
+        if (*p == '\\' || *p == '/') name = p + 1;
+    for (i = 0; i < (int)n && i < MAX_PATH - 1; i++)
+        low[i] = (path[i] >= 'A' && path[i] <= 'Z') ? path[i] + 32 : path[i];
+    low[i] = 0;
+    is_sys = (strstr(low, "\\windows\\") != NULL);
+    wsprintfA(buf, "%s+0x%lX", name, addr - (DWORD)hmod);
+    return is_sys ? 2 : 1;
+}
 
 #define CRASH_SEEN_N    32
 #define CRASH_REARM_MS  2000     /* re-log a recurring EIP after this gap */
@@ -54,6 +89,26 @@ static int crash_suppress(DWORD addr)
         g_seenCount++;
     }
     return 0;
+}
+
+/* Human name for an exception code, so the header reads "ACCESS_VIOLATION"
+ * instead of a bare C0000005 that has to be looked up. */
+static const char *exc_name(DWORD code)
+{
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:      return "ACCESS_VIOLATION";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:   return "ILLEGAL_INSTRUCTION";
+    case EXCEPTION_PRIV_INSTRUCTION:      return "PRIV_INSTRUCTION";
+    case EXCEPTION_STACK_OVERFLOW:        return "STACK_OVERFLOW";
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: return "ARRAY_BOUNDS_EXCEEDED";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:    return "INT_DIVIDE_BY_ZERO";
+    case EXCEPTION_IN_PAGE_ERROR:         return "IN_PAGE_ERROR";
+    case EXCEPTION_DATATYPE_MISALIGNMENT: return "DATATYPE_MISALIGNMENT";
+    case EXCEPTION_INT_OVERFLOW:          return "INT_OVERFLOW";
+    case 0xC0000409UL:                    return "STACK_BUFFER_OVERRUN";
+    case 0xE06D7363UL:                    return "C++_EXCEPTION";
+    default:                              return "unknown";
+    }
 }
 
 static int is_severe(DWORD code)
@@ -301,28 +356,79 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
         return;
     }
 
-    pmc_log("crash", "==== %s EXCEPTION %08lX @ EIP=%08lX (flags=%lX) ====",
-            via, er->ExceptionCode, eip, er->ExceptionFlags);
+    {
+        char eipmod[128];
+        resolve_addr(eip, eipmod, sizeof(eipmod));
+        pmc_log("crash", "==== %s EXCEPTION %08lX %s @ EIP=%08lX (%s) (flags=%lX) ====",
+                via, er->ExceptionCode, exc_name(er->ExceptionCode), eip,
+                eipmod[0] ? eipmod : "unknown module", er->ExceptionFlags);
+    }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
         DWORD kind = (DWORD)er->ExceptionInformation[0];
-        pmc_log("crash", "  AV %s target=%08lX",
-                kind == 1 ? "WRITE" : kind == 8 ? "EXEC" : "READ",
-                (DWORD)er->ExceptionInformation[1]);
+        DWORD tgt  = (DWORD)er->ExceptionInformation[1];
+        const char *op = kind == 1 ? "WRITE" : kind == 8 ? "EXEC" : "READ";
+        char tgtmod[128];
+        const char *cls;
+        resolve_addr(tgt, tgtmod, sizeof(tgtmod));
+        pmc_log("crash", "  AV %s target=%08lX%s%s", op, tgt,
+                tgtmod[0] ? "  " : "", tgtmod);
+        /* Classify the target so the failure mode is obvious at a glance. */
+        if (tgt < 0x00010000UL) {
+            cls = "NULL page — a NULL/garbage pointer was dereferenced (base + small field offset)";
+        } else {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery((LPCVOID)tgt, &mbi, sizeof(mbi)) != sizeof(mbi))
+                cls = "invalid address";
+            else if (mbi.State != MEM_COMMIT)
+                cls = "unmapped/reserved memory (freed, or never allocated)";
+            else if (kind == 1 && !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                     PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                cls = "write to read-only memory (const/.rdata or code)";
+            else
+                cls = "mapped but wrong — stale/type-confused pointer or out-of-range index";
+        }
+        pmc_log("crash", "  -> %s", cls);
+        /* Register correlation: which register held the base pointer? Find the GP
+         * register nearest the fault target within a plausible struct-field span,
+         * so "target = ECX + 0x8" is spelled out instead of left to the eye. */
+        {
+            const DWORD regs[7] = { cx->Eax, cx->Ecx, cx->Edx, cx->Ebx,
+                                    cx->Esi, cx->Edi, cx->Ebp };
+            const char *names[7] = { "EAX", "ECX", "EDX", "EBX", "ESI", "EDI", "EBP" };
+            int best = -1; long bestd = 0x7FFFFFFF; int r;
+            for (r = 0; r < 7; r++) {
+                long d = (long)(tgt - regs[r]);
+                long ad = d < 0 ? -d : d;
+                if (ad <= 0x4000 && ad < (bestd < 0 ? -bestd : bestd)) { best = r; bestd = d; }
+            }
+            if (best >= 0)
+                pmc_log("crash", "  -> faulting pointer = %s(%08lX) %c 0x%lX%s",
+                        names[best], regs[best], bestd < 0 ? '-' : '+',
+                        bestd < 0 ? -bestd : bestd,
+                        regs[best] < 0x00010000UL ? "   [base register is itself near-NULL]" : "");
+        }
     }
     pmc_log("crash", "  EAX=%08lX ECX=%08lX EDX=%08lX EBX=%08lX",
             cx->Eax, cx->Ecx, cx->Edx, cx->Ebx);
     pmc_log("crash", "  ESP=%08lX EBP=%08lX ESI=%08lX EDI=%08lX",
             cx->Esp, cx->Ebp, cx->Esi, cx->Edi);
 
-    /* Shallow stack walk: exe-range return addresses just above ESP. Skipped on
-     * stack overflow, where reading the stack would re-fault on the guard page. */
+    /* Shallow stack walk: return addresses just above ESP that land in an
+     * application module (the exe OR a loaded .asi / game-dir dll). Resolving via
+     * the module table — instead of the old hardcoded 0x401000..0xC00000 exe
+     * range — is what lets an ASI frame (e.g. lua_trace.asi+0x2251, loaded high at
+     * 0x6D980000) actually show up; the old range silently dropped every such
+     * frame. System-module frames (ntdll/kernel32/nvidia) are skipped as noise.
+     * Skipped entirely on stack overflow, where reading the stack would re-fault
+     * on the guard page. */
     if (er->ExceptionCode != EXCEPTION_STACK_OVERFLOW) {
         const DWORD *sp = (const DWORD *)cx->Esp;
         int i, found = 0;
-        for (i = 0; i < 160 && found < 16; i++) {
+        for (i = 0; i < 160 && found < 24; i++) {
             DWORD v = sp[i];
-            if (v >= 0x00401000UL && v < 0x00C00000UL) {
-                pmc_log("crash", "  stk+%03X = %08lX", i * 4, v);
+            char m[128];
+            if (resolve_addr(v, m, sizeof(m)) == 1) {
+                pmc_log("crash", "  stk+%03X = %08lX  %s", i * 4, v, m);
                 found++;
             }
         }
@@ -358,11 +464,13 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
                 DWORD n = avail < 48 ? avail : 48;
                 const DWORD *w = (const DWORD *)p;
                 DWORD k;
-                char line[160];
+                char line[256], m[128];
                 int off = 0;
                 off += wsprintfA(line + off, "  [%s=%08lX]", names[r], p);
                 for (k = 0; k + 4 <= n && k < 48; k += 4)
                     off += wsprintfA(line + off, " %08lX", w[k / 4]);
+                if (resolve_addr(p, m, sizeof(m)))
+                    off += wsprintfA(line + off, "  (%s)", m);
                 pmc_log("crash", "%s", line);
             }
         }
