@@ -19,6 +19,8 @@
  *      - scripts/ subfolder
  *      - plugins/ subfolder
  *      - update/ subfolder
+ *      Stands down to dxwrapper's loader when it is configured to do this
+ *      (see "dxwrapper interop" below).
  *   6. Reports load success/failure for each plugin
  *   7. Exports pmc_log() — centralized logging API for all ASI plugins.
  *      Writes timestamped, source-tagged lines to the console AND to a
@@ -206,6 +208,70 @@ static DWORD WINAPI SpawnFlagWatchdog(LPVOID param) {
     return 0;
 }
 
+/* --- dxwrapper interop ---
+ *
+ * dxwrapper (elishacloud/dxwrapper) is a DirectX proxy that ships its own ASI
+ * loader: with [Plugins] LoadPlugins=1 it LoadLibrary's every *.asi in the game
+ * root, scripts\ and plugins\ (Utils::LoadPlugins). Both of us scanning the same
+ * files means two loaders owning the same job, so when dxwrapper is configured
+ * to load plugins we stand down and let it. Everything else we do — SecuROM
+ * spoof, console, crash handler, spawn fix, hooks, the pmc_log export — is not
+ * something dxwrapper provides, so it stays on regardless.
+ *
+ * Detection is file/config based rather than GetModuleHandle("dxwrapper.dll")
+ * on purpose: we are loaded from the exe's import table and our DllMain can run
+ * BEFORE dxwrapper's, so the module is not reliably present yet at this point.
+ * The on-disk config is the order-independent statement of intent. A missed
+ * detection degrades to the old behaviour (we load the plugins; dxwrapper's
+ * later LoadLibrary is then just a refcount bump), never to nothing loading.
+ */
+
+static int FileExists(const char *path) {
+    DWORD attr = GetFileAttributesA(path);
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/**
+ * Resolve the ini dxwrapper will actually read, mirroring its CONFIG::Init:
+ * "<wrapper>-<process>.ini" is preferred, "<wrapper>.ini" is the fallback.
+ * Returns 0 when dxwrapper is not installed alongside the exe (the documented
+ * layout is dxwrapper.dll + ini + a stub next to the game), or has no config.
+ */
+static int FindDxWrapperConfig(const char *exe_dir, char *out_ini) {
+    char wrapper[MAX_PATH];
+    wsprintfA(wrapper, "%sdxwrapper.dll", exe_dir);
+    if (!FileExists(wrapper) && !GetModuleHandleA("dxwrapper.dll"))
+        return 0;
+
+    char proc[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, proc, MAX_PATH)) return 0;
+    char *sep = strrchr(proc, '\\');
+    char *base = sep ? sep + 1 : proc;
+    char *ext = strrchr(base, '.');
+    if (ext) *ext = '\0';
+
+    wsprintfA(out_ini, "%sdxwrapper-%s.ini", exe_dir, base);
+    if (FileExists(out_ini)) return 1;
+
+    wsprintfA(out_ini, "%sdxwrapper.ini", exe_dir);
+    return FileExists(out_ini);
+}
+
+/**
+ * Whether dxwrapper is configured to load the .asi plugins itself.
+ * out_scripts_only reports its LoadFromScriptsOnly setting, which decides
+ * whether it skips the game root (and so whether we still have to cover it).
+ */
+static int DxWrapperOwnsPlugins(const char *exe_dir, int *out_scripts_only) {
+    char ini[MAX_PATH];
+    if (!FindDxWrapperConfig(exe_dir, ini)) return 0;
+    if (!GetPrivateProfileIntA("Plugins", "LoadPlugins", 0, ini)) return 0;
+
+    *out_scripts_only = GetPrivateProfileIntA("Plugins", "LoadFromScriptsOnly", 0, ini) != 0;
+    pmc_log("blackbox", "  dxwrapper config: %s", ini);
+    return 1;
+}
+
 /* --- ASI plugin loader --- */
 
 static HINSTANCE g_hinstSelf = NULL;
@@ -276,11 +342,17 @@ static int LoadASIsFromDirectory(const char *dir_path, const char *display_prefi
  * This matches the Ultimate ASI Loader's search paths, so existing
  * configurations (scripts/global.ini, file layout) work unchanged.
  * xinput1_3.dll (or any other ASI loader proxy) can be removed entirely.
+ *
+ * When dxwrapper is loading plugins we scan only the paths it does NOT cover:
+ * it never looks in update/, and it skips the game root under
+ * LoadFromScriptsOnly. Those still need us, or plugins there would silently
+ * stop loading.
  */
 static void LoadASIPlugins(void) {
     char exe_dir[MAX_PATH];
     char sub_dir[MAX_PATH];
     int total = 0, loaded = 0, failed = 0;
+    int scripts_only = 0;
 
     GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
     char *last_sep = strrchr(exe_dir, '\\');
@@ -289,23 +361,32 @@ static void LoadASIPlugins(void) {
     pmc_log("blackbox", "[ASI Loader]");
     pmc_log("blackbox", "  Base: %s", exe_dir);
 
-    /* 1. Game root */
-    total += LoadASIsFromDirectory(exe_dir, "", &loaded, &failed);
+    int dxwrapper = DxWrapperOwnsPlugins(exe_dir, &scripts_only);
+    if (dxwrapper)
+        pmc_log("blackbox", "  dxwrapper owns plugin loading — skipping %s",
+                scripts_only ? "scripts\\ + plugins\\" : "root + scripts\\ + plugins\\");
 
-    /* 2. scripts/ */
-    wsprintfA(sub_dir, "%sscripts\\", exe_dir);
-    total += LoadASIsFromDirectory(sub_dir, "scripts\\", &loaded, &failed);
+    /* 1. Game root — dxwrapper covers it unless it is scripts-only */
+    if (!dxwrapper || scripts_only)
+        total += LoadASIsFromDirectory(exe_dir, "", &loaded, &failed);
 
-    /* 3. plugins/ */
-    wsprintfA(sub_dir, "%splugins\\", exe_dir);
-    total += LoadASIsFromDirectory(sub_dir, "plugins\\", &loaded, &failed);
+    if (!dxwrapper) {
+        /* 2. scripts/ */
+        wsprintfA(sub_dir, "%sscripts\\", exe_dir);
+        total += LoadASIsFromDirectory(sub_dir, "scripts\\", &loaded, &failed);
 
-    /* 4. update/ */
+        /* 3. plugins/ */
+        wsprintfA(sub_dir, "%splugins\\", exe_dir);
+        total += LoadASIsFromDirectory(sub_dir, "plugins\\", &loaded, &failed);
+    }
+
+    /* 4. update/ — dxwrapper never scans this one */
     wsprintfA(sub_dir, "%supdate\\", exe_dir);
     total += LoadASIsFromDirectory(sub_dir, "update\\", &loaded, &failed);
 
     if (total == 0) {
-        pmc_log("blackbox", "  (no .asi plugins found)");
+        pmc_log("blackbox", dxwrapper ? "  (nothing to load — dxwrapper has the rest)"
+                                      : "  (no .asi plugins found)");
     }
     pmc_log("blackbox", "  Summary: %d loaded, %d failed, %d total", loaded, failed, total);
 }

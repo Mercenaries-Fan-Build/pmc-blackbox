@@ -9,6 +9,7 @@
 - **Crash handler:** Logs exception info, registers, and call stack on a crash for easier diagnostics.
 - **Lua logging hooks:** Captures the game's stripped-out log stream. **Off by default** — the hook detours the game's hot shared log stub and runs per-call stack resolution + formatting on every funneled call, too costly for regular gameplay. Set `PMC_VERBOSE_LOG=1` to install it for a diagnostic run (every line + `@script:line`, plus world-load milestones under the `world` source). Output goes to the console + `pmc_blackbox.log`.
 - **ASI loader:** Discovers and loads all `.asi` plugins from `scripts/`, `plugins/`, `update/`, and the game root — replacing the need for a separate ASI loader DLL.
+- **dxwrapper aware:** If [dxwrapper](https://github.com/elishacloud/dxwrapper) is installed next to the exe with `[Plugins] LoadPlugins = 1`, it already loads `.asi` plugins itself. Rather than run two loaders over the same files, pmc_bb stands down and lets it own that job, still loading only the paths dxwrapper does not scan (`update/`, plus the game root when its `LoadFromScriptsOnly = 1`). Everything else here — SecuROM spoof, console, crash handler, hooks, `pmc_log` — is unaffected and has no dxwrapper equivalent. No configuration needed on our side; it reads dxwrapper's own ini (`dxwrapper-<process>.ini`, falling back to `dxwrapper.ini`).
 
 ## Installation
 
