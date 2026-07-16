@@ -76,7 +76,59 @@ static int resolve_addr(DWORD addr, char *buf, int buflen)
 static DWORD g_seen[CRASH_SEEN_N];
 static DWORD g_seenTick[CRASH_SEEN_N];
 static int   g_seenCount;
-static LONG  g_inHandler;            /* reentrancy guard */
+
+/* Handler ownership. A single in-handler flag conflated two different jobs:
+ * per-thread REENTRANCY (the handler's own code faulted, must not recurse) and
+ * process-wide EXCLUSION (two threads at once interleave, and pmc_log drops
+ * lines outright when its lock is contended). One flag doing both meant a FATAL
+ * crash on thread B was silently dropped while thread A sat in a first-chance
+ * log — losing the killing blow, the one report that matters most.
+ *
+ * Track the OWNING thread id instead, which separates the two: reentry is
+ * "owner == me", contention is "owner == someone else". A first-chance hit still
+ * yields to a busy handler (it is throttled and survivable anyway); a fatal one
+ * never gives up. */
+static LONG  g_ownerTid;             /* tid inside log_exception; 0 = free */
+
+/* How long a fatal report waits for another thread's handler to finish. Waiting
+ * is what actually saves the report: pmc_log drops lines while its lock is held,
+ * so barging in on a live handler would shred both. Bounded so a wedged holder
+ * can never hang the crash path — a frozen process is worse than a torn log. */
+#define FATAL_WAIT_MS   1000
+
+/* Acquire the handler. Returns 0 = do not log, 1 = log (we own it),
+ * 2 = log anyway (taken from a holder that would not finish). */
+static int handler_enter(int force)
+{
+    LONG tid = (LONG)GetCurrentThreadId();
+    DWORD start;
+
+    if (g_ownerTid == tid)                                          /* logging itself faulted */
+        return 0;
+    if (InterlockedCompareExchange(&g_ownerTid, tid, 0) == 0)
+        return 1;
+    if (!force)                                                     /* first-chance yields */
+        return 0;
+
+    /* Fatal: the process is going down and this is the killing blow. Give the
+     * holder a window to finish and release, then report regardless.
+     * Time the wait off the clock, NOT off a count of Sleep(5) calls: the
+     * scheduler tick is ~15.6ms, so counting nominal sleeps overshoots the
+     * bound by ~3x and the "never hangs" guarantee stops holding. */
+    start = GetTickCount();
+    while (GetTickCount() - start < FATAL_WAIT_MS) {
+        Sleep(5);
+        if (InterlockedCompareExchange(&g_ownerTid, tid, 0) == 0)
+            return 1;
+    }
+    InterlockedExchange(&g_ownerTid, tid);
+    return 2;
+}
+
+static void handler_leave(void)
+{
+    InterlockedExchange(&g_ownerTid, 0);
+}
 
 /* Return 1 if this faulting EIP should be SUPPRESSED right now. A site is logged
  * on first sight and re-logged once CRASH_REARM_MS has elapsed since its last
@@ -359,15 +411,21 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
     CONTEXT *cx = ep->ContextRecord;
     DWORD eip = (DWORD)(ULONG_PTR)er->ExceptionAddress;
 
-    if (InterlockedExchange(&g_inHandler, 1))   /* logging itself faulted */
+    int owned = handler_enter(force);
+    if (!owned)
         return;
     /* `force` (the fatal/last-chance path) ALWAYS logs; first-chance is throttled
      * per-EIP so a handled fault that later recurs fatally is still captured. */
     if (!force && crash_suppress(eip)) {
-        InterlockedExchange(&g_inHandler, 0);
+        handler_leave();
         return;
     }
-    g_richResolve = force;   /* gate loader-lock module resolution to the fatal path */
+    /* Gate loader-lock module resolution to the fatal path. When owned==2 a
+     * first-chance handler is still running on another thread and will see this
+     * flip to 1 — i.e. it may take the loader lock it was meant to avoid. That
+     * trade only ever happens on the last-chance path, where the process is
+     * terminating and there is no spawn left to perturb. */
+    g_richResolve = force;
 
     {
         char eipmod[128];
@@ -544,7 +602,7 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
         dump_prmg_registry(cx);
 
     pmc_log_flush();
-    InterlockedExchange(&g_inHandler, 0);
+    handler_leave();
 }
 
 static LONG CALLBACK VehHandler(EXCEPTION_POINTERS *ep)
