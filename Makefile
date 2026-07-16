@@ -41,7 +41,7 @@ EXTRA_CFLAGS =
 # "v0.4.0" rather than "vv0.4.0".
 VERSION_STR  = $(VERSION:v%=%)
 VERSION_DEF  = -DPMC_BLACKBOX_VERSION='"$(VERSION_STR)"'
-CFLAGS      = -O2 -Wall -Wno-unused-function -I$(MINHOOK_INC) -shared -Wl,--enable-stdcall-fixup $(VERSION_DEF) $(EXTRA_CFLAGS)
+CFLAGS      = -O2 -Wall -Wno-unused-function -I$(MINHOOK_INC) -shared -Wl,--enable-stdcall-fixup -Wl,--no-insert-timestamp $(VERSION_DEF) $(EXTRA_CFLAGS)
 LDFLAGS     = -lkernel32 -luser32
 
 .PHONY: all clean mingw msvc help
@@ -51,6 +51,12 @@ all: mingw
 mingw: $(SRCS_BB) $(DEF)
 	$(CC_MINGW) $(CFLAGS) -o $(TARGET) $(SRCS_ALL) $(DEF) $(LDFLAGS)
 	-$(STRIP_MINGW) $(TARGET) 2>/dev/null || strip $(TARGET)
+	@# Reproducible build: zero the two build-time-varying PE fields so identical
+	@# source yields an identical hash (this ld ignores -Wl,--no-insert-timestamp).
+	@# e_lfanew=0x80 → COFF TimeDateStamp @0x88, PE CheckSum @0xD8 (derived, and
+	@# unverified for normal user-mode DLLs). Code bytes are untouched.
+	@printf '\0\0\0\0' | dd of=$(TARGET) bs=1 seek=136 count=4 conv=notrunc 2>/dev/null
+	@printf '\0\0\0\0' | dd of=$(TARGET) bs=1 seek=216 count=4 conv=notrunc 2>/dev/null
 	@echo "Built: $(TARGET) v$(VERSION_STR) ($$(wc -c < $(TARGET)) bytes)"
 	@echo "Place next to Mercenaries2.exe (no separate MinHook DLL needed)"
 
