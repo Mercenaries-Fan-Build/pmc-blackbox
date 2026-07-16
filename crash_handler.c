@@ -25,6 +25,17 @@
 extern void pmc_log(const char *source, const char *fmt, ...);
 extern void pmc_log_flush(void);
 
+/* Set to `force` at the top of log_exception: 1 on the fatal/last-chance path,
+ * 0 on a first-chance VEH hit. resolve_addr() consults it and skips the
+ * loader-lock module APIs (GetModuleHandleExA/GetModuleFileNameA) entirely when
+ * 0. A first-chance exception can fire on a thread that is contending for the
+ * loader lock during world spawn/streaming; hammering those APIs there (up to
+ * ~160x in the stack walk) perturbed the spawn and dropped the player through
+ * the map into the pool. So first-chance stays as light as v0.4.1 (no loader
+ * lock), and the rich module-resolved report runs only when the crash is
+ * actually fatal. */
+static int g_richResolve;
+
 /* Resolve `addr` to human-readable "module.dll+0xOFFSET" form in `buf`. This is
  * what turns a bare faulting EIP (e.g. 6D982251) into "lua_trace.asi+0x2251" so
  * nobody has to hand-subtract the module base to find WHERE it died. Returns a
@@ -42,6 +53,7 @@ static int resolve_addr(DWORD addr, char *buf, int buflen)
     DWORD n;
     int i, is_sys;
     buf[0] = 0;
+    if (!g_richResolve) return 0;   /* first-chance: no loader-lock APIs (see g_richResolve) */
     if (addr < 0x00010000UL) return 0;
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -355,6 +367,7 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
         InterlockedExchange(&g_inHandler, 0);
         return;
     }
+    g_richResolve = force;   /* gate loader-lock module resolution to the fatal path */
 
     {
         char eipmod[128];
@@ -427,8 +440,14 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
         for (i = 0; i < 160 && found < 24; i++) {
             DWORD v = sp[i];
             char m[128];
-            if (resolve_addr(v, m, sizeof(m)) == 1) {
-                pmc_log("crash", "  stk+%03X = %08lX  %s", i * 4, v, m);
+            if (force) {
+                if (resolve_addr(v, m, sizeof(m)) == 1) {
+                    pmc_log("crash", "  stk+%03X = %08lX  %s", i * 4, v, m);
+                    found++;
+                }
+            } else if (v >= 0x00401000UL && v < 0x00C00000UL) {
+                /* first-chance: exe-range check only (v0.4.1) — no loader-lock resolve */
+                pmc_log("crash", "  stk+%03X = %08lX", i * 4, v);
                 found++;
             }
         }
