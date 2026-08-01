@@ -52,8 +52,16 @@
 #endif
 #define SECUROM_XOR_KEY 0x19EA3FD3
 
-/* --- SecuROM event spoof --- */
-
+/* --- SecuROM event spoof ---
+ *
+ * Compiled out of the logging-only build (-DPMC_DISABLE_SECUROM_EVENT, the `log`
+ * make target → pmc_bb_log.dll). That build ships next to a LICENSED copy, loaded
+ * via dxwrapper instead of a patched import table: the stock exe is satisfied by
+ * the machine's real SecuROM activation, so this DLL must never fabricate the auth
+ * event. The spoof code is absent from that binary, not merely skipped. Everything
+ * else (console, logging, crash handler, spawn fix, ASI loader + dxwrapper interop)
+ * is identical to the default build. */
+#ifndef PMC_DISABLE_SECUROM_EVENT
 static HANDLE g_securomEvent = NULL;
 
 static void CreateSecuROMEvent(void) {
@@ -63,6 +71,7 @@ static void CreateSecuROMEvent(void) {
     wsprintfA(event_name, "v7_%04d", derived);
     g_securomEvent = CreateEventA(NULL, TRUE, TRUE, event_name);
 }
+#endif
 
 /* --- Centralized logging --- */
 
@@ -162,7 +171,11 @@ static void InitDebugConsole(void) {
     pmc_log("blackbox", "  PMC Blackbox v%s (ASI Loader)", PMC_BLACKBOX_VERSION);
     pmc_log("blackbox", "============================================");
     pmc_log("blackbox", "  PID: %lu", (unsigned long)GetCurrentProcessId());
+#ifndef PMC_DISABLE_SECUROM_EVENT
     pmc_log("blackbox", "  SecuROM event: created (signaled)");
+#else
+    pmc_log("blackbox", "  SecuROM event: skipped (logging-only build; licensed copy)");
+#endif
     pmc_log("blackbox", "============================================");
 }
 
@@ -428,8 +441,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         DisableThreadLibraryCalls(hinstDLL);
         g_hinstSelf = hinstDLL;
 
-        /* The SecuROM event MUST be created before the Sitext stub checks it */
+#ifndef PMC_DISABLE_SECUROM_EVENT
+        /* The SecuROM event MUST be created before the Sitext stub checks it.
+         * Absent from the logging-only build — see CreateSecuROMEvent above. */
         CreateSecuROMEvent();
+#endif
 
         /* Debug console — safe in DllMain for AllocConsole */
         InitDebugConsole();

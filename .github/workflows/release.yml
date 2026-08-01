@@ -20,13 +20,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-i686
 
-      - name: Build pmc_bb.dll
-        # Stamp the DLL with the exact release tag (github.ref_name is e.g. v0.4.0
+      - name: Build pmc_bb.dll + pmc_bb_log.dll
+        # Stamp both DLLs with the exact release tag (github.ref_name is e.g. v0.4.0
         # on a tag push). For manual workflow_dispatch runs off a branch, fall back
-        # to the Makefile's git-describe default.
-        run: make mingw ${{ github.ref_type == 'tag' && format('VERSION={0}', github.ref_name) || '' }}
+        # to the Makefile's git-describe default. `log` is the licensed-copy build
+        # (no SecuROM event); the modkit downloads it and installs it as pmc_bb.dll.
+        run: |
+          V="${{ github.ref_type == 'tag' && format('VERSION={0}', github.ref_name) || '' }}"
+          make mingw $V
+          make log $V
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: pmc_bb.dll
+          files: |
+            pmc_bb.dll
+            pmc_bb_log.dll

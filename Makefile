@@ -15,6 +15,10 @@ STRIP_MINGW = i686-w64-mingw32-strip
 CC_MSVC     = cl
 
 TARGET      = pmc_bb.dll
+# Logging-only build for LICENSED copies: same DLL with the SecuROM event compiled
+# out (no DRM spoof). Loaded via dxwrapper next to an untouched, activated exe; the
+# ASI loader + dxwrapper interop stay, so it's still the mod loader/log bridge.
+LOG_TARGET  = pmc_bb_log.dll
 DEF         = pmc_blackbox.def
 
 # --- Version stamped into the DLL banner ---
@@ -44,7 +48,7 @@ VERSION_DEF  = -DPMC_BLACKBOX_VERSION='"$(VERSION_STR)"'
 CFLAGS      = -O2 -Wall -Wno-unused-function -I$(MINHOOK_INC) -shared -Wl,--enable-stdcall-fixup -Wl,--no-insert-timestamp $(VERSION_DEF) $(EXTRA_CFLAGS)
 LDFLAGS     = -lkernel32 -luser32
 
-.PHONY: all clean mingw msvc help
+.PHONY: all clean mingw log msvc msvc-log help
 
 all: mingw
 
@@ -60,17 +64,34 @@ mingw: $(SRCS_BB) $(DEF)
 	@echo "Built: $(TARGET) v$(VERSION_STR) ($$(wc -c < $(TARGET)) bytes)"
 	@echo "Place next to Mercenaries2.exe (no separate MinHook DLL needed)"
 
+# Logging-only build (licensed copies): same sources, SecuROM event compiled out.
+# Mirrors `mingw` — same version stamping and reproducible zeroing.
+log: EXTRA_CFLAGS += -DPMC_DISABLE_SECUROM_EVENT
+log: $(SRCS_BB) $(DEF)
+	$(CC_MINGW) $(CFLAGS) -o $(LOG_TARGET) $(SRCS_ALL) $(DEF) $(LDFLAGS)
+	-$(STRIP_MINGW) $(LOG_TARGET) 2>/dev/null || strip $(LOG_TARGET)
+	@printf '\0\0\0\0' | dd of=$(LOG_TARGET) bs=1 seek=136 count=4 conv=notrunc 2>/dev/null
+	@printf '\0\0\0\0' | dd of=$(LOG_TARGET) bs=1 seek=216 count=4 conv=notrunc 2>/dev/null
+	@echo "Built: $(LOG_TARGET) v$(VERSION_STR) ($$(wc -c < $(LOG_TARGET)) bytes) — no SecuROM event"
+	@echo "For LICENSED copies: dxwrapper loads this via LoadCustomDllPath; install it as pmc_bb.dll"
+
 msvc: $(SRCS_BB) $(DEF)
 	$(CC_MSVC) /LD /O2 /GS- /I$(MINHOOK_INC) $(VERSION_DEF) $(SRCS_ALL) /link /DEF:$(DEF) /OUT:$(TARGET) kernel32.lib user32.lib
 	@echo "Built: $(TARGET) v$(VERSION_STR)"
 
+msvc-log: $(SRCS_BB) $(DEF)
+	$(CC_MSVC) /LD /O2 /GS- /DPMC_DISABLE_SECUROM_EVENT /I$(MINHOOK_INC) $(VERSION_DEF) $(SRCS_ALL) /link /DEF:$(DEF) /OUT:$(LOG_TARGET) kernel32.lib user32.lib
+	@echo "Built: $(LOG_TARGET) v$(VERSION_STR) — no SecuROM event"
+
 clean:
-	rm -f $(TARGET) pmc_blackbox.obj pmc_blackbox.exp pmc_blackbox.lib *.o
+	rm -f $(TARGET) $(LOG_TARGET) pmc_blackbox.obj pmc_blackbox.exp pmc_blackbox.lib *.o
 
 help:
 	@echo "Usage:"
-	@echo "  make mingw   — Cross-compile with MinGW (macOS/Linux/Windows)"
-	@echo "  make msvc    — Compile with MSVC (Windows)"
+	@echo "  make mingw   — Cross-compile pmc_bb.dll with MinGW (SecuROM event + loader)"
+	@echo "  make log     — Cross-compile pmc_bb_log.dll (logging-only, no SecuROM event)"
+	@echo "  make msvc    — Compile pmc_bb.dll with MSVC (Windows)"
+	@echo "  make msvc-log— Compile pmc_bb_log.dll with MSVC (Windows)"
 	@echo "  make clean   — Remove build artifacts"
 	@echo ""
 	@echo "Output: pmc_bb.dll (~8-10 KB) [PMC Blackbox v1]"
