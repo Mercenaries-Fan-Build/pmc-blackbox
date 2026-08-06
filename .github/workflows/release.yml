@@ -20,6 +20,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-mingw-w64-i686
 
+      - name: Test the BUILD-record digest
+        # The DLL is 32-bit Windows and is never executed in CI, so the one piece
+        # with a silent failure mode gets checked on the host instead: a wrong
+        # SHA-256 would ship 64 plausible hex characters that match nothing on
+        # the consuming side, and nothing downstream would notice.
+        run: make check
+
       - name: Build pmc_bb.dll + pmc_bb_log.dll
         # Stamp both DLLs with the exact release tag (github.ref_name is e.g. v0.4.0
         # on a tag push). For manual workflow_dispatch runs off a branch, fall back

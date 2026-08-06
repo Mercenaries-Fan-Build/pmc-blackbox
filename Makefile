@@ -32,7 +32,7 @@ MINHOOK_INC  = ./minhook
 MINHOOK_SRC  = ./minhook
 
 # --- Source files (trimmed public release) ---
-SRCS_BB     = pmc_blackbox.c lua_log_hook.c crash_handler.c
+SRCS_BB     = pmc_blackbox.c lua_log_hook.c crash_handler.c build_id.c sha256.c
 SRCS_MH     = $(MINHOOK_SRC)/hook.c \
               $(MINHOOK_SRC)/buffer.c \
               $(MINHOOK_SRC)/trampoline.c \
@@ -48,9 +48,19 @@ VERSION_DEF  = -DPMC_BLACKBOX_VERSION='"$(VERSION_STR)"'
 CFLAGS      = -O2 -Wall -Wno-unused-function -I$(MINHOOK_INC) -shared -Wl,--enable-stdcall-fixup -Wl,--no-insert-timestamp $(VERSION_DEF) $(EXTRA_CFLAGS)
 LDFLAGS     = -lkernel32 -luser32
 
-.PHONY: all clean mingw log msvc msvc-log help
+# --- Host test ---
+# The DLL is a 32-bit Windows binary and cannot be run on the machines it is
+# usually built on, so the one piece with a silent failure mode — the SHA-256
+# behind the `BUILD` records — is kept in portable C and tested natively here.
+CC_HOST    ?= cc
+
+.PHONY: all clean check mingw log msvc msvc-log help
 
 all: mingw
+
+check: sha256.c test_sha256.c sha256.h
+	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_sha256_test sha256.c test_sha256.c
+	/tmp/pmc_sha256_test
 
 mingw: $(SRCS_BB) $(DEF)
 	$(CC_MINGW) $(CFLAGS) -o $(TARGET) $(SRCS_ALL) $(DEF) $(LDFLAGS)
@@ -92,6 +102,7 @@ help:
 	@echo "  make log     — Cross-compile pmc_bb_log.dll (logging-only, no SecuROM event)"
 	@echo "  make msvc    — Compile pmc_bb.dll with MSVC (Windows)"
 	@echo "  make msvc-log— Compile pmc_bb_log.dll with MSVC (Windows)"
+	@echo "  make check   — Host-native test of the SHA-256 behind the BUILD records"
 	@echo "  make clean   — Remove build artifacts"
 	@echo ""
 	@echo "Output: pmc_bb.dll (~8-10 KB) [PMC Blackbox v1]"
