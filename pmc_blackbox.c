@@ -42,6 +42,7 @@
 #include <stdarg.h>
 #include "lua_log_hook.h"
 #include "crash_handler.h"
+#include "build_id.h"
 
 /* Version string embedded in the startup banner. The build injects the exact
  * git tag via -DPMC_BLACKBOX_VERSION (see Makefile / release.yml) so the DLL
@@ -244,6 +245,14 @@ static int FileExists(const char *path) {
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* The exe's own folder, with a trailing backslash. Empty on failure. */
+static void GetExeDir(char *out /* MAX_PATH */) {
+    char *sep;
+    if (!GetModuleFileNameA(NULL, out, MAX_PATH)) { out[0] = '\0'; return; }
+    sep = strrchr(out, '\\');
+    if (sep) *(sep + 1) = '\0'; else out[0] = '\0';
+}
+
 /**
  * Resolve the ini dxwrapper will actually read, mirroring its CONFIG::Init:
  * "<wrapper>-<process>.ini" is preferred, "<wrapper>.ini" is the fallback.
@@ -360,16 +369,19 @@ static int LoadASIsFromDirectory(const char *dir_path, const char *display_prefi
  * it never looks in update/, and it skips the game root under
  * LoadFromScriptsOnly. Those still need us, or plugins there would silently
  * stop loading.
+ *
+ * Returns the PMC_SELF_* state describing what we just did, which is what the
+ * `LOADER self=` token reports. It is returned rather than recomputed because
+ * the answer depends on a config file read at this instant — recomputing it
+ * later could disagree with what actually happened.
  */
-static void LoadASIPlugins(void) {
+static int LoadASIPlugins(void) {
     char exe_dir[MAX_PATH];
     char sub_dir[MAX_PATH];
     int total = 0, loaded = 0, failed = 0;
     int scripts_only = 0;
 
-    GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
-    char *last_sep = strrchr(exe_dir, '\\');
-    if (last_sep) *(last_sep + 1) = '\0';
+    GetExeDir(exe_dir);
 
     pmc_log("blackbox", "[ASI Loader]");
     pmc_log("blackbox", "  Base: %s", exe_dir);
@@ -402,6 +414,8 @@ static void LoadASIPlugins(void) {
                                       : "  (no .asi plugins found)");
     }
     pmc_log("blackbox", "  Summary: %d loaded, %d failed, %d total", loaded, failed, total);
+
+    return dxwrapper ? PMC_SELF_STOOD_DOWN : PMC_SELF_ENABLED;
 }
 
 
@@ -483,8 +497,33 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         FixSpawnValidation();
         CreateThread(NULL, 0, SpawnFlagWatchdog, NULL, 0, NULL);
 
-        /* Load all .asi plugins (replaces external ASI loader) */
-        LoadASIPlugins();
+        /* Load all .asi plugins (replaces external ASI loader).
+         *
+         * PMC_DISABLE_ASI_LOADER builds everything else and leaves plugin
+         * loading to whatever else is installed. The `LOADER self=disabled`
+         * token below is what tells a log reader that happened — without it,
+         * "no ASI records in this log" is indistinguishable from "the user has
+         * no plugins", which is exactly the ambiguity this pair of lines
+         * exists to remove. */
+#ifndef PMC_DISABLE_ASI_LOADER
+        int self_state = LoadASIPlugins();
+#else
+        int self_state = PMC_SELF_DISABLED;
+        pmc_log("blackbox", "[ASI Loader] DISABLED at build time");
+#endif
+
+        /* Which ASI loader is actually live. Cheap (two GetFileAttributes
+         * sweeps), so it stays here on the startup path where it is guaranteed
+         * to be written even if the process dies moments later. */
+        char exe_dir[MAX_PATH];
+        GetExeDir(exe_dir);
+        EmitLoaderIdentity(exe_dir, self_state);
+
+        /* Content-fingerprint the exe, the sidecar DLLs, the loaded .asi
+         * plugins and the WADs. Spawns a thread and returns immediately: the
+         * hashing reads hundreds of megabytes, and doing that here would hold
+         * the loader lock across every byte of it. */
+        StartBuildFingerprint(hinstDLL);
     }
     return TRUE;
 }
