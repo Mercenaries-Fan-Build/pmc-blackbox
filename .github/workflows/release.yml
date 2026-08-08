@@ -85,7 +85,7 @@ jobs:
             check "$f" 'v7_%04d'          "$want_crack" "SecuROM event"
             check "$f" '%s*.asi'          "$want_asi"   "ASI loader"
             check "$f" 'pmc_blackbox.log' "$want_log"   "log-stack"
-            check "$f" 'LOADER active='   "$want_log"   "run identity"
+            check "$f" 'LOADER self='     "$want_log"   "run identity"
           done
 
           echo "All six variants verified."

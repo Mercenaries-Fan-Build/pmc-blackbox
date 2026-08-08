@@ -15,7 +15,7 @@
 # Three independent features. Every published DLL is one subset of them:
 #
 #   crack   SecuROM v7 event spoof                    -DPMC_DISABLE_SECUROM_EVENT
-#   asi     ASI loader + dxwrapper interop            -DPMC_DISABLE_ASI_LOADER
+#   asi     ASI loader, four search paths             -DPMC_DISABLE_ASI_LOADER
 #   log     console, pmc_blackbox.log, pmc_log,       -DPMC_DISABLE_LOG_STACK
 #           crash handler, Lua hooks, BUILD/LOADER
 #

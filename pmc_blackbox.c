@@ -22,8 +22,8 @@
  *      - scripts/ subfolder
  *      - plugins/ subfolder
  *      - update/ subfolder
- *      Stands down to dxwrapper's loader when it is configured to do this
- *      (see "dxwrapper interop" below).
+ *      Always all four; it never checks for other loaders (see "Coexisting
+ *      with other ASI loaders" below).
  *   6. Reports load success/failure for each plugin
  *   7. Exports pmc_log() — centralized logging API for all ASI plugins.
  *      Writes timestamped, source-tagged lines to the console AND to a
@@ -65,7 +65,7 @@
  * Three independent features, each compiled out by its own flag:
  *
  *   crack   SecuROM v7 event spoof            -DPMC_DISABLE_SECUROM_EVENT
- *   asi     ASI loader + dxwrapper interop    -DPMC_DISABLE_ASI_LOADER
+ *   asi     ASI loader, four search paths -DPMC_DISABLE_ASI_LOADER
  *   log     the log-stack                     -DPMC_DISABLE_LOG_STACK
  *
  * The log-stack is the console, pmc_blackbox.log, the pmc_log transport, the
@@ -284,28 +284,41 @@ static DWORD WINAPI SpawnFlagWatchdog(LPVOID param) {
     return 0;
 }
 
-/* --- dxwrapper interop ---
+/* --- Coexisting with other ASI loaders ---
  *
- * dxwrapper (elishacloud/dxwrapper) is a DirectX proxy that ships its own ASI
- * loader: with [Plugins] LoadPlugins=1 it LoadLibrary's every *.asi in the game
- * root, scripts\ and plugins\ (Utils::LoadPlugins). Both of us scanning the same
- * files means two loaders owning the same job, so when dxwrapper is configured
- * to load plugins we stand down and let it. Everything else we do — SecuROM
- * spoof, console, crash handler, spawn fix, hooks, the pmc_log export — is not
- * something dxwrapper provides, so it stays on regardless.
+ * We do not look for them. No DLL-name probing, no reading another loader's
+ * config, no module-list sniffing — pmc_bb scans its four search paths and
+ * loads what is there, and that is the whole policy.
  *
- * Detection is file/config based rather than GetModuleHandle("dxwrapper.dll")
- * on purpose: we are loaded from the exe's import table and our DllMain can run
- * BEFORE dxwrapper's, so the module is not reliably present yet at this point.
- * The on-disk config is the order-independent statement of intent. A missed
- * detection degrades to the old behaviour (we load the plugins; dxwrapper's
- * later LoadLibrary is then just a refcount bump), never to nothing loading.
+ * This is a deliberate reversal. Earlier builds detected dxwrapper (by
+ * dxwrapper.dll's presence, then by parsing its ini) and stood down so the two
+ * of us would not scan the same directories. It worked, but the mechanism does
+ * not survive contact with the rest of the ecosystem or with antivirus:
+ *
+ *   - It cannot generalize. dxwrapper has one fixed filename; the Ultimate ASI
+ *     Loader family is renamed to whatever the game already imports (dinput8,
+ *     version, winmm, ...). Detecting those means shipping the canonical
+ *     DLL-search-order-hijack name set, which is exactly the string feature
+ *     that got v0.5.1 flagged as Trojan:Win32/Wacatac.B!ml. See "Antivirus" in
+ *     the README.
+ *   - Config-first does not rescue it. Ultimate ASI Loader defaults to
+ *     LoadPlugins=1 and needs no ini at all, so "no config present" is its
+ *     normal loading state rather than evidence of anything; and its ini may be
+ *     named after the DLL (version.dll -> version.ini), so finding the config
+ *     requires the DLL name anyway.
+ *   - It was never load-bearing. The old code said so itself: a missed
+ *     detection just means we load the plugins and the other loader's later
+ *     LoadLibrary is a refcount bump. Standing down was an optimization, and
+ *     its failure mode (stand down when nobody else is loading) is the bad one,
+ *     because then nothing loads at all.
+ *
+ * So the contract is inverted. Rather than pmc_bb guessing about everyone else,
+ * whoever owns plugin loading decides at INSTALL time by choosing the variant:
+ * ship a build with the ASI loader compiled out and there is no second loader
+ * to coordinate with, because the code is absent rather than merely idle.
+ * modkit owns the install directory and makes that call; see the variant matrix
+ * in the Makefile. Double-loading, when it does happen, is a refcount bump.
  */
-
-static int FileExists(const char *path) {
-    DWORD attr = GetFileAttributesA(path);
-    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
-}
 
 /* The exe's own folder, with a trailing backslash. Empty on failure. */
 static void GetExeDir(char *out /* MAX_PATH */) {
@@ -314,48 +327,6 @@ static void GetExeDir(char *out /* MAX_PATH */) {
     sep = strrchr(out, '\\');
     if (sep) *(sep + 1) = '\0'; else out[0] = '\0';
 }
-
-/**
- * Resolve the ini dxwrapper will actually read, mirroring its CONFIG::Init:
- * "<wrapper>-<process>.ini" is preferred, "<wrapper>.ini" is the fallback.
- * Returns 0 when dxwrapper is not installed alongside the exe (the documented
- * layout is dxwrapper.dll + ini + a stub next to the game), or has no config.
- */
-static int FindDxWrapperConfig(const char *exe_dir, char *out_ini) {
-    char wrapper[MAX_PATH];
-    wsprintfA(wrapper, "%sdxwrapper.dll", exe_dir);
-    if (!FileExists(wrapper) && !GetModuleHandleA("dxwrapper.dll"))
-        return 0;
-
-    char proc[MAX_PATH];
-    if (!GetModuleFileNameA(NULL, proc, MAX_PATH)) return 0;
-    char *sep = strrchr(proc, '\\');
-    char *base = sep ? sep + 1 : proc;
-    char *ext = strrchr(base, '.');
-    if (ext) *ext = '\0';
-
-    wsprintfA(out_ini, "%sdxwrapper-%s.ini", exe_dir, base);
-    if (FileExists(out_ini)) return 1;
-
-    wsprintfA(out_ini, "%sdxwrapper.ini", exe_dir);
-    return FileExists(out_ini);
-}
-
-/**
- * Whether dxwrapper is configured to load the .asi plugins itself.
- * out_scripts_only reports its LoadFromScriptsOnly setting, which decides
- * whether it skips the game root (and so whether we still have to cover it).
- */
-static int DxWrapperOwnsPlugins(const char *exe_dir, int *out_scripts_only) {
-    char ini[MAX_PATH];
-    if (!FindDxWrapperConfig(exe_dir, ini)) return 0;
-    if (!GetPrivateProfileIntA("Plugins", "LoadPlugins", 0, ini)) return 0;
-
-    *out_scripts_only = GetPrivateProfileIntA("Plugins", "LoadFromScriptsOnly", 0, ini) != 0;
-    pmc_log("blackbox", "  dxwrapper config: %s", ini);
-    return 1;
-}
-
 /* --- ASI plugin loader --- */
 
 static HINSTANCE g_hinstSelf = NULL;
@@ -431,57 +402,46 @@ static int LoadASIsFromDirectory(const char *dir_path, const char *display_prefi
  * configurations (scripts/global.ini, file layout) work unchanged.
  * xinput1_3.dll (or any other ASI loader proxy) can be removed entirely.
  *
- * When dxwrapper is loading plugins we scan only the paths it does NOT cover:
- * it never looks in update/, and it skips the game root under
- * LoadFromScriptsOnly. Those still need us, or plugins there would silently
- * stop loading.
+ * All four paths are scanned unconditionally. We do not check whether another
+ * loader is installed or what it is configured to do — see "Coexisting with
+ * other ASI loaders" above for why that check was removed and why the overlap
+ * it used to avoid is harmless.
  *
- * Returns the PMC_SELF_* state describing what we just did, which is what the
- * `LOADER self=` token reports. It is returned rather than recomputed because
- * the answer depends on a config file read at this instant — recomputing it
- * later could disagree with what actually happened.
+ * Returns the PMC_SELF_* state for the `LOADER self=` token. With this compiled
+ * in the answer is always PMC_SELF_ENABLED; the constant is still routed
+ * through so the DllMain call site stays identical whether or not the loader
+ * was built at all.
  */
 static int LoadASIPlugins(void) {
     char exe_dir[MAX_PATH];
     char sub_dir[MAX_PATH];
     int total = 0, loaded = 0, failed = 0;
-    int scripts_only = 0;
 
     GetExeDir(exe_dir);
 
     pmc_log("blackbox", "[ASI Loader]");
     pmc_log("blackbox", "  Base: %s", exe_dir);
 
-    int dxwrapper = DxWrapperOwnsPlugins(exe_dir, &scripts_only);
-    if (dxwrapper)
-        pmc_log("blackbox", "  dxwrapper owns plugin loading — skipping %s",
-                scripts_only ? "scripts\\ + plugins\\" : "root + scripts\\ + plugins\\");
+    /* 1. Game root */
+    total += LoadASIsFromDirectory(exe_dir, "", &loaded, &failed);
 
-    /* 1. Game root — dxwrapper covers it unless it is scripts-only */
-    if (!dxwrapper || scripts_only)
-        total += LoadASIsFromDirectory(exe_dir, "", &loaded, &failed);
+    /* 2. scripts/ */
+    wsprintfA(sub_dir, "%sscripts\\", exe_dir);
+    total += LoadASIsFromDirectory(sub_dir, "scripts\\", &loaded, &failed);
 
-    if (!dxwrapper) {
-        /* 2. scripts/ */
-        wsprintfA(sub_dir, "%sscripts\\", exe_dir);
-        total += LoadASIsFromDirectory(sub_dir, "scripts\\", &loaded, &failed);
+    /* 3. plugins/ */
+    wsprintfA(sub_dir, "%splugins\\", exe_dir);
+    total += LoadASIsFromDirectory(sub_dir, "plugins\\", &loaded, &failed);
 
-        /* 3. plugins/ */
-        wsprintfA(sub_dir, "%splugins\\", exe_dir);
-        total += LoadASIsFromDirectory(sub_dir, "plugins\\", &loaded, &failed);
-    }
-
-    /* 4. update/ — dxwrapper never scans this one */
+    /* 4. update/ */
     wsprintfA(sub_dir, "%supdate\\", exe_dir);
     total += LoadASIsFromDirectory(sub_dir, "update\\", &loaded, &failed);
 
-    if (total == 0) {
-        pmc_log("blackbox", dxwrapper ? "  (nothing to load — dxwrapper has the rest)"
-                                      : "  (no .asi plugins found)");
-    }
+    if (total == 0)
+        pmc_log("blackbox", "  (no .asi plugins found)");
     pmc_log("blackbox", "  Summary: %d loaded, %d failed, %d total", loaded, failed, total);
 
-    return dxwrapper ? PMC_SELF_STOOD_DOWN : PMC_SELF_ENABLED;
+    return PMC_SELF_ENABLED;
 }
 
 
@@ -588,12 +548,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
          * trade for a zero-footprint build — a crack_only or crack_asi run
          * leaves nothing behind for the modkit's debug bundle to collect. */
 #ifndef PMC_DISABLE_LOG_STACK
-        /* Which ASI loader is actually live. Cheap (two GetFileAttributes
-         * sweeps), so it stays here on the startup path where it is guaranteed
-         * to be written even if the process dies moments later. */
-        char exe_dir[MAX_PATH];
-        GetExeDir(exe_dir);
-        EmitLoaderIdentity(exe_dir, self_state);
+        /* What we did about plugin loading. Touches nothing on disk, so it
+         * stays here on the startup path where it is guaranteed to be written
+         * even if the process dies moments later. */
+        EmitLoaderIdentity(self_state);
 
         /* Content-fingerprint the exe, the sidecar DLLs, the loaded .asi
          * plugins and the WADs. Spawns a thread and returns immediately: the

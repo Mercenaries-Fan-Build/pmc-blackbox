@@ -6,7 +6,7 @@
  *   1. `BUILD` records — a content fingerprint of every artifact that was
  *      actually loaded: the running executable, the loader/sidecar DLLs, every
  *      `.asi` in the module list, and the WADs beside the exe.
- *   2. The `LOADER` line — which ASI loader is live in THIS process.
+ *   2. The `LOADER` line — what THIS process did about loading plugins.
  *
  * ## Why the log has to carry this
  *
@@ -17,11 +17,13 @@
  * sibling may have been launched instead, or the stock one directly, or via
  * Steam. `GetModuleFileNameA(NULL)` is the only source that cannot be wrong.
  *
- * Likewise the ASI loader: a DRM-free build and a stock SecuROM build are
+ * Likewise our own loader: a DRM-free build and a stock SecuROM build are
  * indistinguishable by import table, dxwrapper's `[Plugins] LoadPlugins=1`
- * moves ownership of plugin loading at runtime, and a third-party proxy loader
- * can be present that nothing else in the toolchain manages. No static
- * catalogue can answer "did ASI mods load"; the process can.
+ * moves ownership of plugin loading at runtime, and our loader can be compiled
+ * out. No static catalogue can answer "did WE load the plugins"; the process
+ * can. Whether some third-party loader is installed is a question about the
+ * directory, not about this process, and belongs to modkit — see
+ * EmitLoaderIdentity.
  *
  * ## Record grammar — DO NOT DRIFT
  *
@@ -480,81 +482,40 @@ void StartBuildFingerprint(HINSTANCE self)
 /* ------------------------------------------------------- loader identity */
 
 /**
- * Proxy-DLL names third-party ASI loaders (Ultimate ASI Loader and friends)
- * ship under. A system DLL by these names lives in System32, so a copy sitting
- * NEXT TO THE EXE is the signal. The token emitted is the name with `.dll`
- * removed, which keeps `external=` a closed vocabulary: it is exactly this
- * list, plus `none` and `multiple`.
- */
-static const char *PROXY_LOADERS[] = {
-    "dinput8.dll", "dsound.dll", "ddraw.dll", "d3d9.dll", "d3d11.dll",
-    "winmm.dll", "version.dll", "xinput1_3.dll", "xlive.dll", "msacm32.dll"
-};
-#define PROXY_N ((int)(sizeof(PROXY_LOADERS)/sizeof(PROXY_LOADERS[0])))
-
-/* Writes the `external=` token into `out` (>= 32 bytes). */
-static void detect_external_loader(const char *exe_dir, char *out)
-{
-    char probe[PATHBUF];
-    const char *found = NULL;
-    int i, count = 0;
-
-    for (i = 0; i < PROXY_N; i++) {
-        wsprintfA(probe, "%s%s", exe_dir, PROXY_LOADERS[i]);
-        if (GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES) {
-            if (!found) found = PROXY_LOADERS[i];
-            count++;
-        }
-    }
-    if (count == 0)      { lstrcpynA(out, "none", 32); return; }
-    if (count > 1)       { lstrcpynA(out, "multiple", 32); return; }
-    lstrcpynA(out, found, 32);
-    { /* strip the ".dll" so the token is a bare name */
-        int n = lstrlenA(out);
-        if (n > 4) out[n - 4] = '\0';
-    }
-}
-
-/**
- * `LOADER active=<a> self=<s> external=<e>` — the one line that says which ASI
- * loader is live in THIS process.
+ * `LOADER self=<enabled|disabled>` — what THIS process did about loading
+ * plugins.
  *
  * The crash-reporting contract derives `game.loader` from the exe catalogue's
  * `ExeEntry.requires`, and that cannot work: a DRM-free `v1.1 patched` build
  * and a stock SecuROM build both carry `requires: null` yet need different
- * answers; dxwrapper's `[Plugins] LoadPlugins=1` moves ownership at runtime
- * from a config file, not a binary; our own loader can be compiled out; and a
- * proxy loader nobody manages can be present. The import table cannot express
- * any of that. This line can, because it is written by the process it describes.
+ * answers, and our loader can be compiled out of the shipped file. The import
+ * table cannot express either. This line can, because it is written by the
+ * process it describes.
  *
- * Every value is a closed token — this becomes an enumerated wire field, and
- * free text there would violate the contract's "enumerated values only" rule.
+ * Scope: pmc_bb reports on ITSELF, and only on what it did. Detecting
+ * third-party mod loaders is modkit's job — it owns the install directory and
+ * can inspect it properly at deploy time, where we could only ever guess at it
+ * from inside the process, and only by carrying the DLL names that got v0.5.1
+ * flagged. See "Coexisting with other ASI loaders" in pmc_blackbox.c.
  *
- *   active   pmc_bb | dxwrapper | external | none
- *   self     enabled | stood_down | disabled
- *   external none | multiple | <a name from PROXY_LOADERS, minus ".dll">
+ * That is why this line lost `active=` and `external=` in v0.6.0, along with
+ * the `stood_down` value of `self`. All three described the relationship
+ * between us and another loader, which is no longer something this process
+ * knows or asks. What is left is the one fact it cannot be wrong about: did
+ * this build scan for plugins. Modkit composes the ecosystem view from that
+ * token plus its own scan.
+ *
+ * The value is a closed token: this becomes an enumerated wire field, and free
+ * text there would violate the contract's "enumerated values only" rule.
  */
-void EmitLoaderIdentity(const char *exe_dir, int self_state)
+void EmitLoaderIdentity(int self_state)
 {
-    char external[32];
-    const char *self_tok, *active;
-
-    detect_external_loader(exe_dir, external);
+    const char *self_tok;
 
     switch (self_state) {
-        case PMC_SELF_STOOD_DOWN: self_tok = "stood_down"; break;
-        case PMC_SELF_DISABLED:   self_tok = "disabled";   break;
-        default:                  self_tok = "enabled";    break;
+        case PMC_SELF_DISABLED: self_tok = "disabled"; break;
+        default:                self_tok = "enabled";  break;
     }
 
-    /* Who owns the plugin scan, in precedence order. `self=stood_down` is by
-     * definition dxwrapper taking over; `self=disabled` leaves whoever else is
-     * present, and `none` when nobody is. */
-    if (self_state == PMC_SELF_ENABLED)          active = "pmc_bb";
-    else if (self_state == PMC_SELF_STOOD_DOWN)  active = "dxwrapper";
-    else if (_stricmp(external, "none") != 0)    active = "external";
-    else                                         active = "none";
-
-    pmc_log("blackbox", "LOADER active=%s self=%s external=%s",
-            active, self_tok, external);
+    pmc_log("blackbox", "LOADER self=%s", self_tok);
 }
