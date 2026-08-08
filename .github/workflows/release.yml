@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0      # full history + tags so `git describe` works on manual runs
+          fetch-depth: 0
 
       - name: Install MinGW
         run: |
@@ -21,26 +21,14 @@ jobs:
           sudo apt-get install -y gcc-mingw-w64-i686
 
       - name: Test the BUILD-record digest
-        # The DLL is 32-bit Windows and is never executed in CI, so the one piece
-        # with a silent failure mode gets checked on the host instead: a wrong
-        # SHA-256 would ship 64 plausible hex characters that match nothing on
-        # the consuming side, and nothing downstream would notice.
         run: make check
 
       - name: Build all six variants
-        # `make all` builds the whole matrix (see the table at the top of the
-        # Makefile). Stamp them with the exact release tag (github.ref_name is
-        # e.g. v0.6.0 on a tag push); for manual workflow_dispatch runs off a
-        # branch, fall back to the Makefile's git-describe default.
         run: |
           V="${{ github.ref_type == 'tag' && format('VERSION={0}', github.ref_name) || '' }}"
           make all $V
 
       - name: Verify the variants are distinct and correctly gated
-        # The variants differ only by -D flags, so a Makefile typo that dropped a
-        # flag would ship two identically-featured DLLs under different names —
-        # and nothing at runtime would complain. Cheap structural check that each
-        # binary really is what its name claims.
         run: |
           set -euo pipefail
 
@@ -51,8 +39,6 @@ jobs:
             exit 1
           fi
 
-          # The plugin-facing ABI must be identical everywhere, so a plugin that
-          # found the module always finds the symbol whichever variant is installed.
           for f in pmc_bb_*.dll; do
             for sym in BlackboxEntry pmc_log pmc_log_flush; do
               i686-w64-mingw32-objdump -p "$f" | grep -qw "$sym" \
@@ -60,20 +46,12 @@ jobs:
             done
           done
 
-          # Each variant must self-describe: the .def deliberately carries no
-          # LIBRARY line so ld stamps the output filename into the export
-          # directory. Re-adding one would silently give all six the same
-          # internal name, and the BUILD record could no longer identify the
-          # variant that produced a log.
           for f in pmc_bb_*.dll; do
             got=$(i686-w64-mingw32-objdump -p "$f" | awk '/^Name /{print $NF; exit}')
             [ "$got" = "$f" ] \
               || { echo "::error::$f reports internal name '$got'"; exit 1; }
           done
 
-          # Feature presence, keyed on strings the compiler cannot fold away.
-          # Note the empty pmc_log stub IS inlined in the quiet builds, so the
-          # log-call format strings vanish with it — do not test on those.
           check() {  # check <file> <marker> <present|absent> <label>
             if strings -a "$1" | grep -qF -- "$2"; then found=present; else found=absent; fi
             [ "$found" = "$3" ] || { echo "::error::$1: $4 is $found, expected $3"; exit 1; }
@@ -90,13 +68,6 @@ jobs:
 
           echo "All six variants verified."
           sha256sum pmc_bb_*.dll
-
-      # Always, including manual runs off a branch. This is how you get the six
-      # DLLs to test WITHOUT cutting a public release — a `workflow_dispatch`
-      # run leaves a downloadable zip on the run page. Needed for antivirus
-      # testing in particular: scanning a candidate build must not require
-      # publishing it first. The release step below cannot serve that, since it
-      # attaches to a tag and there is none on a branch run.
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
