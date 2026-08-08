@@ -318,18 +318,35 @@ static int scan_modules(int (*want)(const char *base), const char *kind)
 
 static int is_asi(const char *base) { return ends_with_ci(base, ".asi"); }
 
-/* The loader/sidecar DLLs the toolchain manages. A module NOT in this list is
+/* The loader/sidecar DLLs the toolchain manages. A module NOT matched here is
  * deliberately left out: enumerating every DLL in the process would sweep in
  * the user's GPU driver and overlay software, which is noise here and widens
- * what the log discloses about the machine. */
+ * what the log discloses about the machine.
+ *
+ * This list is used two ways — as a filter over the mapped modules, and as a
+ * set of basenames to stat on disk for sidecars that have not loaded yet — so
+ * it holds only names that are fixed. Our own DLL is not one of them: it ships
+ * under six variant filenames, and is matched by is_pmc_bb below instead. */
 static const char *SIDECAR_DLLS[] = {
-    "pmc_bb.dll", "dxwrapper.dll", "cruise.dll", "binkw32.dll"
+    "dxwrapper.dll", "cruise.dll", "binkw32.dll"
 };
 #define SIDECAR_N ((int)(sizeof(SIDECAR_DLLS)/sizeof(SIDECAR_DLLS[0])))
+
+/* Any pmc_bb build variant, by prefix. The running copy is already emitted by
+ * its mapped path before this scan runs, so what this actually catches is a
+ * SECOND variant mapped into the same process — a misconfiguration (two copies
+ * installed under different names) that is worth seeing in the log rather than
+ * filtering out. Prefix, not the six literal names, so the check does not have
+ * to be revised every time the variant set changes. */
+static int is_pmc_bb(const char *base)
+{
+    return _strnicmp(base, "pmc_bb", 6) == 0 && ends_with_ci(base, ".dll");
+}
 
 static int is_sidecar(const char *base)
 {
     int i;
+    if (is_pmc_bb(base)) return 1;
     for (i = 0; i < SIDECAR_N; i++)
         if (_stricmp(base, SIDECAR_DLLS[i]) == 0) return 1;
     return 0;
@@ -402,7 +419,8 @@ static void pass_one(void)
     emit_artifact("exe", exe_path);
 
     /* This DLL, by its mapped path: under dxwrapper's LoadCustomDllPath the
-     * bytes that are running need not be <exe_dir>\pmc_bb.dll at all. */
+     * bytes that are running need not sit beside the exe at all. The basename
+     * this yields is what names the build variant in the log. */
     if (g_self && GetModuleFileNameA(g_self, full, MAX_PATH))
         emit_artifact("dll", full);
 

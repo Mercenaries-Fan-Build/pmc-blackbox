@@ -1,7 +1,16 @@
-; pmc_bb.dll export definition
-; The game's import table references pmc_bb.dll by ordinal #1.
-; pmc_log is exported by name for ASI plugins to resolve via GetProcAddress.
-LIBRARY pmc_bb
+; Export definition — shared by all six build variants.
+;
+; There is deliberately NO `LIBRARY` line. It would stamp one fixed module name
+; into every variant's export directory, and the variants ship under six
+; different filenames; ld instead takes the name from the output file, so each
+; DLL describes itself. Nothing binds against that field anyway — the exe's
+; import table names the DLL it wants, and resolves BlackboxEntry by ordinal #1.
+;
+; pmc_log is exported by name for ASI plugins to resolve via GetProcAddress. All
+; three exports are present in EVERY variant: the quiet builds
+; (-DPMC_DISABLE_LOG_STACK) back pmc_log/pmc_log_flush with inert stubs rather
+; than dropping them, so a plugin that has found the module always finds the
+; symbol, whichever variant is installed.
 EXPORTS
     BlackboxEntry @1
     pmc_log

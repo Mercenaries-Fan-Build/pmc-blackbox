@@ -1,13 +1,16 @@
 /**
- * pmc_bb.dll — SecuROM Spoof + Debug Console + ASI Loader + Compat Hooks
- *                    for Mercenaries 2: World in Flames
+ * pmc_bb — SecuROM Spoof + Debug Console + ASI Loader + Compat Hooks
+ *                for Mercenaries 2: World in Flames
  *
  * Self-contained entry point that replaces the need for a separate ASI loader
  * (xinput1_3.dll / dinput8.dll proxy). Loaded via the game's import table.
  *
- * IMPORTANT: The game's import table must reference "pmc_bb.dll" (not
- * "cruise.dll"). The exe patcher (mercs2-crack-game) handles this
- * automatically — it injects pmc_bb.dll into the import table.
+ * IMPORTANT: The game's import table must reference this DLL by whatever
+ * filename it is installed under — there is no required name, and nothing here
+ * depends on one. The exe patcher (mercs2-crack-game) handles this: it injects
+ * the installed filename into the import table and binds BlackboxEntry by
+ * ordinal #1. The no-crack variants are not imported at all; dxwrapper loads
+ * them by path via LoadCustomDllPath.
  *
  * Responsibilities:
  *   1. Creates the SecuROM v7 spoof Event (mandatory for game boot)
@@ -29,8 +32,14 @@
  * The DLL exports BlackboxEntry by ordinal #1 (the game's import table
  * resolves this by ordinal) and pmc_log by name.
  *
+ * Not every build contains all of the above: the three features (SecuROM
+ * spoof, ASI loader, log-stack) are independently compiled out to produce the
+ * six published variants. See "Build variants" below and the matrix at the top
+ * of the Makefile.
+ *
  * Build (MinGW cross-compile):
- *   make mingw   (see Makefile for full command)
+ *   make all                       (all six variants)
+ *   make pmc_bb_fully_loaded.dll   (just one)
  *
  * Architecture: 32-bit (x86) Windows DLL — Mercenaries 2 is a 32-bit game.
  */
@@ -51,17 +60,51 @@
 #ifndef PMC_BLACKBOX_VERSION
 #define PMC_BLACKBOX_VERSION "0.0.0-dev"
 #endif
+/* --- Build variants ---
+ *
+ * Three independent features, each compiled out by its own flag:
+ *
+ *   crack   SecuROM v7 event spoof            -DPMC_DISABLE_SECUROM_EVENT
+ *   asi     ASI loader + dxwrapper interop    -DPMC_DISABLE_ASI_LOADER
+ *   log     the log-stack                     -DPMC_DISABLE_LOG_STACK
+ *
+ * The log-stack is the console, pmc_blackbox.log, the pmc_log transport, the
+ * crash handler, the Lua hooks, and the BUILD/LOADER run-identity records. It
+ * is one flag rather than six because those parts are not independently
+ * useful: the crash handler and the run-identity records have nowhere to write
+ * without the transport, and a transport with no producers is an open file
+ * handle that never gets a line. The Makefile pairs this flag with dropping
+ * the sources outright (crash_handler.c, lua_log_hook.c, build_id.c, sha256.c
+ * and all of MinHook), so a quiet build does not merely skip that code, it
+ * does not contain it.
+ *
+ * pmc_log and pmc_log_flush stay EXPORTED in every variant, as inert stubs
+ * where the log-stack is out, so a plugin that has found the module always
+ * finds the symbol. A varying export set would make GetProcAddress("pmc_log")
+ * succeed or fail based on which build the user installed — a difference the
+ * plugin cannot anticipate and cannot do anything useful about. Plugins
+ * brought in by some other loader call it even in builds whose own loader is
+ * compiled out, so the symbol has to survive there too. */
+#ifdef PMC_DISABLE_LOG_STACK
+#  ifndef PMC_DISABLE_CRASH_HANDLER
+#    define PMC_DISABLE_CRASH_HANDLER
+#  endif
+#  ifndef PMC_DISABLE_LUA_LOG_HOOK
+#    define PMC_DISABLE_LUA_LOG_HOOK
+#  endif
+#endif
+
 #define SECUROM_XOR_KEY 0x19EA3FD3
 
 /* --- SecuROM event spoof ---
  *
- * Compiled out of the logging-only build (-DPMC_DISABLE_SECUROM_EVENT, the `log`
- * make target → pmc_bb_log.dll). That build ships next to a LICENSED copy, loaded
- * via dxwrapper instead of a patched import table: the stock exe is satisfied by
- * the machine's real SecuROM activation, so this DLL must never fabricate the auth
- * event. The spoof code is absent from that binary, not merely skipped. Everything
- * else (console, logging, crash handler, spawn fix, ASI loader + dxwrapper interop)
- * is identical to the default build. */
+ * Compiled out by -DPMC_DISABLE_SECUROM_EVENT, which is what separates the two
+ * no-crack variants (asi_log, log_only) from the four cracked ones. Those
+ * ship next to a LICENSED copy, loaded via dxwrapper instead of a patched import
+ * table: the stock exe is satisfied by the machine's real SecuROM activation, so
+ * this DLL must never fabricate the auth event. The spoof code is absent from
+ * those binaries, not merely skipped at runtime. Which other features come along
+ * is a separate question answered by the variant — see "Build variants" above. */
 #ifndef PMC_DISABLE_SECUROM_EVENT
 static HANDLE g_securomEvent = NULL;
 
@@ -74,7 +117,11 @@ static void CreateSecuROMEvent(void) {
 }
 #endif
 
-/* --- Centralized logging --- */
+/* --- Centralized logging ---
+ *
+ * The whole block through InitDebugConsole() is compiled out by
+ * -DPMC_DISABLE_LOG_STACK, which substitutes the stubs at the far end. */
+#ifndef PMC_DISABLE_LOG_STACK
 
 static FILE*           g_logfile = NULL;
 static CRITICAL_SECTION g_logLock;
@@ -175,10 +222,25 @@ static void InitDebugConsole(void) {
 #ifndef PMC_DISABLE_SECUROM_EVENT
     pmc_log("blackbox", "  SecuROM event: created (signaled)");
 #else
-    pmc_log("blackbox", "  SecuROM event: skipped (logging-only build; licensed copy)");
+    pmc_log("blackbox", "  SecuROM event: skipped (no-crack build; licensed copy)");
 #endif
     pmc_log("blackbox", "============================================");
 }
+
+#else /* PMC_DISABLE_LOG_STACK */
+
+/* Inert stubs for the quiet variants. Exported so the plugin-facing ABI is
+ * identical across all six (see "Build variants" at the top): there is no
+ * console, no pmc_blackbox.log and no lock behind these, so a call formats
+ * nothing and returns. Arguments are still evaluated by the caller, which is
+ * why call sites must not hide side effects in their format arguments. */
+__declspec(dllexport) void pmc_log(const char *source, const char *fmt, ...) {
+    (void)source; (void)fmt;
+}
+
+__declspec(dllexport) void pmc_log_flush(void) { }
+
+#endif /* PMC_DISABLE_LOG_STACK */
 
 /* --- Underground spawn fix --- */
 
@@ -300,11 +362,15 @@ static HINSTANCE g_hinstSelf = NULL;
 
 /**
  * Case-insensitive check whether a filename should be skipped (self-load prevention).
- * Skips: pmc_bb.dll, pmc_bb.asi, and the DLL's own module filename.
+ * Skips anything named pmc_bb* and the DLL's own module filename.
+ *
+ * The prefix test covers the variant filenames (pmc_bb_crack_asi.dll and the
+ * rest) without naming them, so it survives a change to the variant set. The
+ * module-filename test below is the one that actually has to be right: it is
+ * what catches a copy renamed to something else entirely.
  */
 static int IsSelfModule(const char *filename) {
-    if (_stricmp(filename, "pmc_bb.dll") == 0) return 1;
-    if (_stricmp(filename, "pmc_bb.asi") == 0) return 1;
+    if (_strnicmp(filename, "pmc_bb", 6) == 0) return 1;
 
     char self_name[MAX_PATH];
     if (GetModuleFileNameA(g_hinstSelf, self_name, MAX_PATH)) {
@@ -421,7 +487,7 @@ static int LoadASIPlugins(void) {
 
 /* --- Exported function (ordinal #1) ---
  *
- * The patched EXE imports pmc_bb.dll by ordinal #1. This function is
+ * The patched EXE imports this DLL by ordinal #1. This function is
  * the target of that import. It doesn't need to do anything — the real work
  * happens in DllMain. But the export must exist for the import to resolve.
  */
@@ -461,8 +527,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         CreateSecuROMEvent();
 #endif
 
-        /* Debug console — safe in DllMain for AllocConsole */
+        /* Debug console + pmc_blackbox.log — safe in DllMain for AllocConsole.
+         * Must come before anything that logs; in a quiet build there is
+         * nothing to initialize and pmc_log is already a stub. */
+#ifndef PMC_DISABLE_LOG_STACK
         InitDebugConsole();
+#endif
 
         /* Crash handler — install first so any later fault is recorded before
          * the process dies. */
@@ -512,6 +582,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         pmc_log("blackbox", "[ASI Loader] DISABLED at build time");
 #endif
 
+        /* Run identity. Both records are log output, so they go out with the
+         * log-stack: a quiet variant writes no log for them to appear in, and
+         * build_id.c is not linked into it at all. That is the deliberate
+         * trade for a zero-footprint build — a crack_only or crack_asi run
+         * leaves nothing behind for the modkit's debug bundle to collect. */
+#ifndef PMC_DISABLE_LOG_STACK
         /* Which ASI loader is actually live. Cheap (two GetFileAttributes
          * sweeps), so it stays here on the startup path where it is guaranteed
          * to be written even if the process dies moments later. */
@@ -524,6 +600,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
          * hashing reads hundreds of megabytes, and doing that here would hold
          * the loader lock across every byte of it. */
         StartBuildFingerprint(hinstDLL);
+#else
+        (void)self_state;
+#endif
     }
     return TRUE;
 }

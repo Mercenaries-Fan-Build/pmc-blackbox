@@ -2,6 +2,6 @@
 *.obj
 *.exp
 *.lib
-pmc_bb.dll
+pmc_bb*.dll
 output/
 .DS_Store

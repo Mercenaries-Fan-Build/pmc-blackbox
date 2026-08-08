@@ -27,19 +27,77 @@ jobs:
         # the consuming side, and nothing downstream would notice.
         run: make check
 
-      - name: Build pmc_bb.dll + pmc_bb_log.dll
-        # Stamp both DLLs with the exact release tag (github.ref_name is e.g. v0.4.0
-        # on a tag push). For manual workflow_dispatch runs off a branch, fall back
-        # to the Makefile's git-describe default. `log` is the licensed-copy build
-        # (no SecuROM event); the modkit downloads it and installs it as pmc_bb.dll.
+      - name: Build all six variants
+        # `make all` builds the whole matrix (see the table at the top of the
+        # Makefile). Stamp them with the exact release tag (github.ref_name is
+        # e.g. v0.6.0 on a tag push); for manual workflow_dispatch runs off a
+        # branch, fall back to the Makefile's git-describe default.
         run: |
           V="${{ github.ref_type == 'tag' && format('VERSION={0}', github.ref_name) || '' }}"
-          make mingw $V
-          make log $V
+          make all $V
+
+      - name: Verify the variants are distinct and correctly gated
+        # The variants differ only by -D flags, so a Makefile typo that dropped a
+        # flag would ship two identically-featured DLLs under different names —
+        # and nothing at runtime would complain. Cheap structural check that each
+        # binary really is what its name claims.
+        run: |
+          set -euo pipefail
+
+          # Every variant must be a distinct binary.
+          if [ "$(sha256sum pmc_bb_*.dll | awk '{print $1}' | sort -u | wc -l)" -ne 6 ]; then
+            echo "::error::two or more variants are byte-identical"
+            sha256sum pmc_bb_*.dll
+            exit 1
+          fi
+
+          # The plugin-facing ABI must be identical everywhere, so a plugin that
+          # found the module always finds the symbol whichever variant is installed.
+          for f in pmc_bb_*.dll; do
+            for sym in BlackboxEntry pmc_log pmc_log_flush; do
+              i686-w64-mingw32-objdump -p "$f" | grep -qw "$sym" \
+                || { echo "::error::$f is missing the $sym export"; exit 1; }
+            done
+          done
+
+          # Each variant must self-describe: the .def deliberately carries no
+          # LIBRARY line so ld stamps the output filename into the export
+          # directory. Re-adding one would silently give all six the same
+          # internal name, and the BUILD record could no longer identify the
+          # variant that produced a log.
+          for f in pmc_bb_*.dll; do
+            got=$(i686-w64-mingw32-objdump -p "$f" | awk '/^Name /{print $NF; exit}')
+            [ "$got" = "$f" ] \
+              || { echo "::error::$f reports internal name '$got'"; exit 1; }
+          done
+
+          # Feature presence, keyed on strings the compiler cannot fold away.
+          # Note the empty pmc_log stub IS inlined in the quiet builds, so the
+          # log-call format strings vanish with it — do not test on those.
+          check() {  # check <file> <marker> <present|absent> <label>
+            if strings -a "$1" | grep -qF -- "$2"; then found=present; else found=absent; fi
+            [ "$found" = "$3" ] || { echo "::error::$1: $4 is $found, expected $3"; exit 1; }
+          }
+          for f in pmc_bb_*.dll; do
+            case "$f" in *crack*|*fully*) want_crack=present ;; *) want_crack=absent ;; esac
+            case "$f" in *asi*|*fully*)   want_asi=present   ;; *) want_asi=absent   ;; esac
+            case "$f" in *log*|*fully*)   want_log=present   ;; *) want_log=absent   ;; esac
+            check "$f" 'v7_%04d'          "$want_crack" "SecuROM event"
+            check "$f" '%s*.asi'          "$want_asi"   "ASI loader"
+            check "$f" 'pmc_blackbox.log' "$want_log"   "log-stack"
+            check "$f" 'LOADER active='   "$want_log"   "run identity"
+          done
+
+          echo "All six variants verified."
+          sha256sum pmc_bb_*.dll
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            pmc_bb.dll
-            pmc_bb_log.dll
+            pmc_bb_fully_loaded.dll
+            pmc_bb_crack_only.dll
+            pmc_bb_crack_asi.dll
+            pmc_bb_crack_log.dll
+            pmc_bb_asi_log.dll
+            pmc_bb_log_only.dll

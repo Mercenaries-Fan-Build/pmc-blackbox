@@ -27,7 +27,8 @@ void EmitLoaderIdentity(const char *exe_dir, int self_state);
  * loader lock is released (CreateThread in DllMain does not run the thread
  * until then). `self` is the DLL's own HINSTANCE, so the record for this
  * module names the bytes that are actually mapped rather than whatever sits
- * at <exe_dir>\pmc_bb.dll.
+ * at some assumed path. That mapped path is also what identifies the build
+ * variant, since each ships under its own filename.
  */
 void StartBuildFingerprint(HINSTANCE self);
 
