@@ -91,7 +91,22 @@ jobs:
           echo "All six variants verified."
           sha256sum pmc_bb_*.dll
 
+      # Always, including manual runs off a branch. This is how you get the six
+      # DLLs to test WITHOUT cutting a public release — a `workflow_dispatch`
+      # run leaves a downloadable zip on the run page. Needed for antivirus
+      # testing in particular: scanning a candidate build must not require
+      # publishing it first. The release step below cannot serve that, since it
+      # attaches to a tag and there is none on a branch run.
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmc_bb-${{ github.ref_name }}-${{ github.sha }}
+          retention-days: 14
+          if-no-files-found: error
+          path: pmc_bb_*.dll
+
       - name: Upload to release
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: |
