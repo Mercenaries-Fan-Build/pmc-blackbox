@@ -75,7 +75,7 @@ MINHOOK_SRC  = ./minhook
 # rest is pulled in only by the log variants. MinHook is here rather than in
 # SRCS_QUIET because lua_log_hook.c is its only consumer.
 SRCS_QUIET  = pmc_blackbox.c
-SRCS_LOG    = lua_log_hook.c crash_handler.c build_id.c sha256.c \
+SRCS_LOG    = lua_log_hook.c log_stub.c crash_handler.c build_id.c sha256.c \
               $(MINHOOK_SRC)/hook.c \
               $(MINHOOK_SRC)/buffer.c \
               $(MINHOOK_SRC)/trampoline.c \
@@ -119,7 +119,7 @@ pmc_bb_log_only.dll:     VARIANT_SRCS  = $(SRCS_FULL)
 # behind the `BUILD` records — is kept in portable C and tested natively here.
 CC_HOST    ?= cc
 
-.PHONY: all clean check mingw msvc help $(addsuffix .msvc,$(VARIANTS))
+.PHONY: all clean check check-log-stub mingw msvc help $(addsuffix .msvc,$(VARIANTS))
 
 all: $(VARIANTS)
 	@echo ""
@@ -128,9 +128,18 @@ all: $(VARIANTS)
 # Back-compat alias for the old entry point, which built the single default DLL.
 mingw: all
 
-check: sha256.c test_sha256.c sha256.h
+check: sha256.c test_sha256.c sha256.h log_stub.c test_log_stub.c log_stub.h
 	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_sha256_test sha256.c test_sha256.c
 	/tmp/pmc_sha256_test
+	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_log_stub_test log_stub.c test_log_stub.c
+	/tmp/pmc_log_stub_test
+
+# The log-stub finder against real executables: pairs of <exe> <expected stub VA>, e.g.
+#   make check-log-stub EXES="v11/Mercenaries2.exe 0x6AEF90 v10/Mercenaries2.exe 0x6D5640"
+check-log-stub: log_stub.c test_log_stub.c log_stub.h
+	@test -n "$(EXES)" || { echo "set EXES to <exe> <expected-va> pairs"; exit 2; }
+	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_log_stub_test log_stub.c test_log_stub.c
+	/tmp/pmc_log_stub_test $(EXES)
 
 $(VARIANTS): $(SRCS_ALL) $(DEF)
 	$(CC_MINGW) $(CFLAGS) $(VARIANT_FLAGS) -o $@ $(VARIANT_SRCS) $(DEF) $(LDFLAGS)
@@ -177,7 +186,8 @@ help:
 	@echo "  make all      — Cross-compile all six variants with MinGW"
 	@echo "  make <asset>  — Cross-compile one, e.g. make pmc_bb_crack_log.dll"
 	@echo "  make msvc     — Compile all six with MSVC (Windows, not reproducible)"
-	@echo "  make check    — Host-native test of the SHA-256 behind the BUILD records"
+	@echo "  make check    — Host-native tests: the SHA-256 behind the BUILD records, the log-stub finder"
+	@echo "  make check-log-stub EXES=\"<exe> <va> ...\" — the log-stub finder against real executables"
 	@echo "  make clean    — Remove build artifacts"
 	@echo ""
 	@echo "Variants (crack = SecuROM spoof, asi = ASI loader, log = log-stack):"
