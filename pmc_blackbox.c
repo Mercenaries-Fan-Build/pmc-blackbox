@@ -501,7 +501,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 #endif
 
         /* Lua/engine log hooking — captures the game's stripped-out log stream.
-         * The hook detours the game's SHARED log stub (0x006D5640), through which
+         * The hook detours the game's SHARED log stub (found per build), through which
          * ~700 stripped subsystem log calls funnel. Every call that survives the
          * cheap pre-filter then pays per-call stack resolution (VirtualQuery
          * syscalls) + per-arg formatting BEFORE anything is (or isn't) emitted —
