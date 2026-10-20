@@ -2,8 +2,9 @@
  * lua_log_hook.h — native capture of the game's stripped-out logging stream
  *
  * The production build redirected ~all of its debug/log functions (Lua `print`,
- * `Debug.Printf`, and ~700 subsystem loggers) to a single shared no-op stub at
- * 0x006D5640. We MinHook that stub's CODE so every funneled message is routed
+ * `Debug.Printf`, and ~700 subsystem loggers) to a single shared no-op stub,
+ * whose address differs per build and is found in the running image (log_stub.h).
+ * We MinHook that stub's CODE so every funneled message is routed
  * to pmc_log() and lands in pmc_blackbox.log natively, with no separate ASI.
  *
  * Hooking the .text stub (not the .rdata func-pointer slots) is what makes this
@@ -15,7 +16,9 @@
 #pragma once
 
 /**
- * Install the MinHook detour on the shared stripped-log stub (0x006D5640).
+ * Install the MinHook detour on the shared stripped-log stub, found in the
+ * running image by FindLogStub. When it cannot be found, nothing is hooked and
+ * the reason is logged.
  * Call once from DllMain AFTER InstallCompatHooks() (MinHook init + pmc_log)
  * and BEFORE LoadASIPlugins(). No .rdata writes.
  *
