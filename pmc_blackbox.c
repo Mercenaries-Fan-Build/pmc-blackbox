@@ -16,16 +16,15 @@
  *   1. Creates the SecuROM v7 spoof Event (mandatory for game boot)
  *   2. Allocates a debug console window with stdout/stderr redirection
  *   3. Installs crash handler + Lua logging hooks
- *   4. Fixes underground spawn validation
- *   5. Discovers and LoadLibrary's all .asi plugins from:
+ *   4. Discovers and LoadLibrary's all .asi plugins from:
  *      - Game root directory
  *      - scripts/ subfolder
  *      - plugins/ subfolder
  *      - update/ subfolder
  *      Always all four; it never checks for other loaders (see "Coexisting
  *      with other ASI loaders" below).
- *   6. Reports load success/failure for each plugin
- *   7. Exports pmc_log() — centralized logging API for all ASI plugins.
+ *   5. Reports load success/failure for each plugin
+ *   6. Exports pmc_log() — centralized logging API for all ASI plugins.
  *      Writes timestamped, source-tagged lines to the console AND to a
  *      single pmc_blackbox.log file on disk.
  *
@@ -52,6 +51,8 @@
 #include "lua_log_hook.h"
 #include "crash_handler.h"
 #include "build_id.h"
+#include "addr_space.h"
+#include "sites.h"
 
 /* Version string embedded in the startup banner. The build injects the exact
  * git tag via -DPMC_BLACKBOX_VERSION (see Makefile / release.yml) so the DLL
@@ -242,48 +243,6 @@ __declspec(dllexport) void pmc_log_flush(void) { }
 
 #endif /* PMC_DISABLE_LOG_STACK */
 
-/* --- Underground spawn fix --- */
-
-#define SPAWN_FLAG_VA  0x00DFBD74
-#define SPAWN_FIX_REAPPLY_DELAY_MS  5000
-#define SPAWN_FIX_REAPPLY_COUNT     4
-#define SPAWN_FIX_REAPPLY_INTERVAL  3000
-
-static void WriteSpawnFlag(void) {
-    BYTE* flag = (BYTE*)SPAWN_FLAG_VA;
-    DWORD oldProtect;
-    if (VirtualProtect(flag, 1, PAGE_READWRITE, &oldProtect)) {
-        *flag = 0x01;
-        VirtualProtect(flag, 1, oldProtect, &oldProtect);
-    }
-}
-
-static void FixSpawnValidation(void) {
-    WriteSpawnFlag();
-    pmc_log("blackbox", "Spawn validation flag set (0x%08X = 0x01)", SPAWN_FLAG_VA);
-}
-
-/*
- * The game's initialization (MOVQ store at ~0x006CEEBA) zeroes the .data region
- * containing the spawn flag AFTER DllMain has already set it.  Re-apply the flag
- * on a background thread after a delay so it persists past that zeroing.
- */
-static DWORD WINAPI SpawnFlagWatchdog(LPVOID param) {
-    (void)param;
-    Sleep(SPAWN_FIX_REAPPLY_DELAY_MS);
-    for (int i = 0; i < SPAWN_FIX_REAPPLY_COUNT; i++) {
-        BYTE current = *(volatile BYTE*)SPAWN_FLAG_VA;
-        if (current != 0x01) {
-            WriteSpawnFlag();
-            pmc_log("blackbox", "Spawn flag re-applied (was 0x%02X, pass %d/%d)",
-                    current, i + 1, SPAWN_FIX_REAPPLY_COUNT);
-        }
-        if (i < SPAWN_FIX_REAPPLY_COUNT - 1)
-            Sleep(SPAWN_FIX_REAPPLY_INTERVAL);
-    }
-    return 0;
-}
-
 /* --- Coexisting with other ASI loaders ---
  *
  * We do not look for them. No DLL-name probing, no reading another loader's
@@ -455,15 +414,20 @@ __declspec(dllexport) int __stdcall BlackboxEntry(void) {
     return 1;
 }
 
-/* Whether the modkit asked for a verbose run. The Lua/engine log hook detours
- * the game's hot shared log stub and runs per-call stack resolution + formatting
- * on every funneled call, which is too costly for regular gameplay — so the hook
- * is NOT installed at all unless PMC_VERBOSE_LOG is set (the stub then stays a
- * no-op and costs nothing). Any value other than unset/empty/"0"/"false"/"no"
- * counts as enabled; the crash handler is unaffected. */
-static BOOL VerboseLoggingRequested(void) {
+/* Whether the modkit asked for a diagnostic: any value other than
+ * unset/empty/"0"/"false"/"no" counts as enabled.
+ *
+ * PMC_VERBOSE_LOG: the Lua/engine log hook detours the game's hot shared log stub
+ * and runs per-call stack resolution + formatting on every funneled call, which
+ * is too costly for regular gameplay — so the hook is NOT installed at all unless
+ * it is set (the stub then stays a no-op and costs nothing).
+ *
+ * PMC_CRASH_MINIDUMP: a dump is about 1.5 GB, so only a run that asks gets one.
+ *
+ * The crash handler is unaffected by either. */
+static BOOL EnvFlagSet(const char *name) {
     char val[16];
-    DWORD n = GetEnvironmentVariableA("PMC_VERBOSE_LOG", val, sizeof(val));
+    DWORD n = GetEnvironmentVariableA(name, val, sizeof(val));
     if (n == 0) return FALSE;          /* unset or empty */
     if (n >= sizeof(val)) return TRUE; /* set to a long value — treat as on */
     if (lstrcmpiA(val, "0") == 0) return FALSE;
@@ -497,7 +461,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         /* Crash handler — install first so any later fault is recorded before
          * the process dies. */
 #ifndef PMC_DISABLE_CRASH_HANDLER
-        InstallCrashHandler();
+        InstallCrashHandler(EnvFlagSet("PMC_CRASH_MINIDUMP"));
+#endif
+
+        /* What this build of the exe keeps where, for the crash record. */
+#ifndef PMC_DISABLE_LOG_STACK
+        PmcSitesStart();
 #endif
 
         /* Lua/engine log hooking — captures the game's stripped-out log stream.
@@ -512,7 +481,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
          * default); set = installed for a full-capture diagnostic run. The crash
          * handler above is always armed regardless. */
 #ifndef PMC_DISABLE_LUA_LOG_HOOK
-        if (VerboseLoggingRequested()) {
+        if (EnvFlagSet("PMC_VERBOSE_LOG")) {
             InstallLuaLogHook();
         } else {
             pmc_log("blackbox", "Lua log hook: OFF "
@@ -521,11 +490,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 #else
         pmc_log("blackbox", "Lua log hook: DISABLED at build time");
 #endif
-
-        /* Fix underground spawn — early write + deferred watchdog thread.
-         * Game init zeroes this flag; the watchdog re-applies it. */
-        FixSpawnValidation();
-        CreateThread(NULL, 0, SpawnFlagWatchdog, NULL, 0, NULL);
 
         /* Load all .asi plugins (replaces external ASI loader).
          *
@@ -552,6 +516,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
          * stays here on the startup path where it is guaranteed to be written
          * even if the process dies moments later. */
         EmitLoaderIdentity(self_state);
+
+        /* The address-space limit this process runs under, then a sample every
+         * PMC_VM_PERIOD_MS, which is what separates running out of address space
+         * from a leak or a driver limit in a bundle from a player's machine. */
+        PmcVmStartSampler();
 
         /* Content-fingerprint the exe, the sidecar DLLs, the loaded .asi
          * plugins and the WADs. Spawns a thread and returns immediately: the
