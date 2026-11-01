@@ -10,7 +10,12 @@
  *
  *   - A Vectored Exception Handler catches the fault FIRST-chance (before any
  *     frame SEH), so it fires even if something later swallows the exception.
- *   - SetUnhandledExceptionFilter catches the classic last-chance fatal path.
+ *   - A detour on UnhandledExceptionFilter catches the last-chance fatal path.
+ *     SetUnhandledExceptionFilter cannot: the game's CRT startup, which runs after
+ *     this DllMain, installs its own filter (0x9EEDA4 in v1.1) and drops the old
+ *     one, so a filter set here never runs. The detour sits in front of whichever
+ *     filter is installed and records only when that filter does not recover, so
+ *     a survivable fault never reaches the record.
  *
  * Safe by construction: faulting EIPs are de-duplicated (a repeating fault logs
  * once), a reentrancy guard prevents recursion if logging itself faults, and the
@@ -21,6 +26,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string.h>
+
+#include "MinHook.h"
+#include "addr_space.h"
+#include "fault_decode.h"
+#include "minidump.h"
+#include "pool_stats.h"
+#include "sites.h"
 
 extern void pmc_log(const char *source, const char *fmt, ...);
 extern void pmc_log_flush(void);
@@ -197,7 +209,7 @@ static int is_severe(DWORD code)
  * derefs entity+0x188 — a handler/delegate that is non-NULL but ZEROED (its
  * +0x10 vtable is NULL). When any GP register at a crash points to an Entity
  * (its first dword == this vtable), post-mortem it below to NAME the culprit. */
-#define ENTITY_VTABLE 0x00BDB410UL
+#define ENTITY_VTABLE PmcSite(PMC_SITE_ENTITY_VTABLE)
 
 /* How many bytes at `p` are safely committed+readable (0 if none). */
 static DWORD safe_avail(DWORD p)
@@ -210,6 +222,175 @@ static DWORD safe_avail(DWORD p)
                          PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
         return 0;
     return ((DWORD)mbi.BaseAddress + (DWORD)mbi.RegionSize) - p;
+}
+
+/* The game exe's executable sections, read once at install. The first-chance stack filter below may
+ * not call the module APIs, and the bounds of the code differ per build. */
+#define MAX_CODE_RANGES 16
+static DWORD g_codeLo[MAX_CODE_RANGES], g_codeHi[MAX_CODE_RANGES];
+static int   g_codeRanges;
+static DWORD g_textLo, g_textHi;
+
+static void capture_code_ranges(void)
+{
+    const BYTE *base = (const BYTE *)GetModuleHandleA(NULL);
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+    const IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION(nt);
+    int i;
+    for (i = 0; i < nt->FileHeader.NumberOfSections && g_codeRanges < MAX_CODE_RANGES; i++) {
+        if (!(s[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        g_codeLo[g_codeRanges] = (DWORD)base + s[i].VirtualAddress;
+        g_codeHi[g_codeRanges] = g_codeLo[g_codeRanges] + s[i].Misc.VirtualSize;
+        if (memcmp(s[i].Name, ".text\0\0\0", 8) == 0) {
+            g_textLo = g_codeLo[g_codeRanges];
+            g_textHi = g_codeHi[g_codeRanges];
+        }
+        g_codeRanges++;
+    }
+}
+
+static int in_game_code(DWORD v)
+{
+    int i;
+    for (i = 0; i < g_codeRanges; i++)
+        if (v >= g_codeLo[i] && v < g_codeHi[i]) return 1;
+    return 0;
+}
+
+/* NtQueryInformationThread, for the address a thread started at. Looked up at install because the
+ * lookup takes the loader lock; ThreadQuerySetWin32StartAddress is information class 9. */
+typedef LONG (WINAPI *NtQueryInformationThreadFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+static NtQueryInformationThreadFn g_ntQueryThread;
+static DWORD g_dllMainTid;
+
+/* Which thread faulted: its id, the thread pmc_bb's DllMain ran on, where it started, its stack. */
+static void log_thread(void)
+{
+    const NT_TIB *tib = (const NT_TIB *)NtCurrentTeb();
+    DWORD start = 0;
+    if (g_ntQueryThread)
+        g_ntQueryThread(GetCurrentThread(), 9, &start, sizeof(start), NULL);
+    pmc_log("crash", "  thread=%lu dllmain_thread=%lu start=%08lX stack=%08lX..%08lX",
+            GetCurrentThreadId(), g_dllMainTid, start,
+            (DWORD)tib->StackLimit, (DWORD)tib->StackBase);
+}
+
+/* Name the operand the faulting instruction used, from its own bytes. */
+static void log_fault_operand(DWORD eip, const CONTEXT *cx, DWORD tgt)
+{
+    const uint32_t regs[8] = { cx->Eax, cx->Ecx, cx->Edx, cx->Ebx, cx->Esp, cx->Ebp, cx->Esi, cx->Edi };
+    const BYTE *code = (const BYTE *)eip;
+    PmcFaultOperand op;
+    char hex[64];
+    int off = 0;
+    unsigned i;
+
+    if (safe_avail(eip) < 16) {
+        pmc_log("crash", "  -> the code at EIP is not readable");
+        return;
+    }
+    if (!PmcDecodeOperand(code, regs, &op)) {
+        pmc_log("crash", "  -> the decoder refused the bytes at EIP: %02X %02X %02X %02X",
+                code[0], code[1], code[2], code[3]);
+        return;
+    }
+    for (i = 0; i < op.length && i < 15; i++)
+        off += wsprintfA(hex + off, "%02X ", code[i]);
+    pmc_log("crash", "  -> instruction: %s", hex);
+    if (!op.memory) {
+        pmc_log("crash", "  -> no ModRM memory operand: the access is implicit (stack, string or absolute)");
+        return;
+    }
+    pmc_log("crash", "  -> operand: base=%s(%08lX) index=%s(%08lX)*%u disp=%ld%s effective=%08lX %s",
+            PmcRegName(op.base), op.base == PMC_REG_NONE ? 0UL : (unsigned long)regs[op.base],
+            PmcRegName(op.index), op.index == PMC_REG_NONE ? 0UL : (unsigned long)regs[op.index],
+            op.scale, (long)op.disp, op.segment ? " seg" : "", (unsigned long)op.effective,
+            op.effective == tgt ? "(the AV target)" : "(not the AV target: another operand faulted)");
+}
+
+/* The faulting thread's stack as raw lines of hex and ASCII, from ESP up to the stack's end or 4 KiB.
+ * The stack filter below keeps only code addresses; asset names sit in a parser's buffers here. */
+#define RAW_STACK_BYTES 0x1000
+#define RAW_LINE_BYTES  32
+
+static void dump_stack_raw(DWORD esp)
+{
+    const NT_TIB *tib = (const NT_TIB *)NtCurrentTeb();
+    DWORD top = (DWORD)tib->StackBase, n, at;
+    DWORD avail = safe_avail(esp);
+    const BYTE *b = (const BYTE *)esp;
+
+    if (esp >= top || !avail) {
+        pmc_log("crash", "  raw stack: ESP %08lX is outside the stack or unreadable", esp);
+        return;
+    }
+    n = top - esp;
+    if (n > avail) n = avail;
+    if (n > RAW_STACK_BYTES) n = RAW_STACK_BYTES;
+    n &= ~3UL;
+    for (at = 0; at < n; at += RAW_LINE_BYTES) {
+        char line[160];
+        int off = wsprintfA(line, "  raw+%03lX:", at);
+        DWORD k, count = n - at < RAW_LINE_BYTES ? n - at : RAW_LINE_BYTES;
+        for (k = 0; k < count; k += 4)
+            off += wsprintfA(line + off, " %08lX", *(const DWORD *)(b + at + k));
+        line[off++] = ' ';
+        line[off++] = '|';
+        for (k = 0; k < count; k++) {
+            BYTE c = b[at + k];
+            line[off++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+        }
+        line[off++] = '|';
+        line[off] = 0;
+        pmc_log("crash", "%s", line);
+    }
+}
+
+static int live_read(void *ctx, uint32_t va, void *out, uint32_t n)
+{
+    (void)ctx;
+    if (safe_avail(va) < n) return 0;
+    memcpy(out, (const void *)va, n);
+    return 1;
+}
+
+static unsigned long pool_kib(uint64_t bytes)
+{
+    return (unsigned long)(bytes / 1024);
+}
+
+/* What the D3D resource pool holds. It never frees a texture, so its free lists show the memory a
+ * session has stranded, which a failed create cannot get back. Other threads may be changing the
+ * lists: a torn read costs a line of wrong numbers here, never a fault. */
+static void log_pool_stats(void)
+{
+    DWORD tex_free = PmcSite(PMC_SITE_TEXTURE_FREE), tex_used = PmcSite(PMC_SITE_TEXTURE_IN_USE);
+    PmcPoolStats s;
+
+    if (!tex_free || !tex_used) {
+        pmc_log("crash", "  (sites unresolved on this build: no pool stats)");
+        return;
+    }
+    PmcPoolWalk(live_read, NULL, tex_free, tex_used, &s);
+    pmc_log("crash", "  pool textures free=%lu/%luKiB used=%lu/%luKiB vb free=%lu/%luKiB used=%lu/%luKiB "
+            "ib free=%lu/%luKiB used=%lu/%luKiB cut=%lu unknown_formats=%lu",
+            (unsigned long)s.texture_free.nodes, pool_kib(s.texture_free.bytes),
+            (unsigned long)s.texture_in_use.nodes, pool_kib(s.texture_in_use.bytes),
+            (unsigned long)s.vb_free.nodes, pool_kib(s.vb_free.bytes),
+            (unsigned long)s.vb_in_use.nodes, pool_kib(s.vb_in_use.bytes),
+            (unsigned long)s.ib_free.nodes, pool_kib(s.ib_free.bytes),
+            (unsigned long)s.ib_in_use.nodes, pool_kib(s.ib_in_use.bytes),
+            (unsigned long)(s.texture_free.unreadable + s.texture_in_use.unreadable + s.vb_free.unreadable +
+                            s.vb_in_use.unreadable + s.ib_free.unreadable + s.ib_in_use.unreadable),
+            (unsigned long)s.unknown_formats);
+}
+
+/* " after-call" when the bytes before `v` end in a call, so `v` can be a return address, " no-call"
+ * when they do not. A stale slot passes this too; it only rules a value out. */
+static const char *call_mark(DWORD v)
+{
+    if (safe_avail(v - 7) < 7 + 16) return "";
+    return PmcFollowsCall((const uint8_t *)v, 7) ? " after-call" : " no-call";
 }
 
 /* Hexdump up to `n` bytes (dwords) at `p`, VirtualQuery-gated. */
@@ -253,13 +434,13 @@ static void scan_ascii(DWORD p, DWORD n, const char *label)
     }
 }
 
-/* Post-mortem an Entity (vtable 0xBDB410) at `ent`: dump its header, the
- * +0x188 handler (the crash target), the +0x28/+0xA0 component containers, and
- * scan all of them for name strings. Read-only, fully VQ-gated. */
+/* Post-mortem an Entity at `ent`: dump its header, the +0x188 handler (the crash
+ * target), the +0x28/+0xA0 component containers, and scan all of them for name
+ * strings. Read-only, fully VQ-gated. */
 static void dump_entity(DWORD ent)
 {
     DWORD handler, cont28, contA0, descr;
-    pmc_log("crash", "  --- ENTITY post-mortem @%08lX (vtable 0xBDB410) ---", ent);
+    pmc_log("crash", "  --- ENTITY post-mortem @%08lX (vtable %08lX) ---", ent, ENTITY_VTABLE);
     dump_at(ent + 0x00, 0x60, "ent+00");
     dump_at(ent + 0x180, 0x20, "ent+180");   /* covers +0x188 handler ptr */
     handler = (safe_avail(ent + 0x188) >= 4) ? *(const DWORD *)(ent + 0x188) : 0;
@@ -289,9 +470,6 @@ static void dump_entity(DWORD ent)
  * post-mortem instead of a (too-hot-to-set) breakpoint. ebp+0x28 carries a valid
  * pointer beside the bogus +0x2c=3, so dump its target too (suspected real array
  * / transposed {ptr,count} pair). */
-#define SPAWN_WALK_LO 0x004AB1A0UL
-#define SPAWN_WALK_HI 0x004AB380UL
-
 static void dump_spawn_walk(CONTEXT *cx)
 {
     DWORD esp = cx->Esp, ebp = cx->Ebp;
@@ -305,7 +483,7 @@ static void dump_spawn_walk(CONTEXT *cx)
         dump_at(param + 0x00, 0x40, "param+00");
         dump_at(param + 0x1c0, 0x60, "param+1C0");   /* covers +0x1e0 model + +0x1e4 index */
         scan_ascii(param, 0x200, "param");
-        if (safe_avail(param) >= 4 && *(const DWORD *)param == ENTITY_VTABLE)
+        if (ENTITY_VTABLE && safe_avail(param) >= 4 && *(const DWORD *)param == ENTITY_VTABLE)
             dump_entity(param);
         /* component container @ +0xA0 (the 0x7E045E type-confusion site) */
         contA0 = (safe_avail(param + 0xA0) >= 4) ? *(const DWORD *)(param + 0xA0) : 0;
@@ -346,19 +524,18 @@ static void dump_spawn_walk(CONTEXT *cx)
  * registered, reverse-resolves the faulting handle to its key, and classifies it
  * — so we can tell converter-mangled key vs unregistered resource vs stale handle.
  * Read-only, VirtualQuery-gated. */
-#define PRMG_KEYTAB  0x0197DE48UL
-#define PRMG_HNDTAB  0x0197DA48UL
 static void dump_prmg_registry(CONTEXT *cx)
 {
     DWORD elem = cx->Edi;          /* the 0x1c4-stride primitive-group element */
     DWORD rec0 = cx->Ebx;          /* record+0 handle (faulting deref [rec0+0xfc]) */
     DWORD rec4 = (safe_avail(elem + 8) >= 4) ? *(const DWORD *)(elem + 4) : 0xFFFFFFFFUL;
-    const DWORD *keys = (const DWORD *)PRMG_KEYTAB;
-    const DWORD *hnds = (const DWORD *)PRMG_HNDTAB;
+    DWORD keytab = PmcSite(PMC_SITE_PRMG_KEYS), hndtab = PmcSite(PMC_SITE_PRMG_HANDLES);
+    const DWORD *keys = (const DWORD *)keytab;
+    const DWORD *hnds = (const DWORD *)hndtab;
     int i, nreg = 0, slot0 = -1;
     char line[256];
     int off;
-    if (safe_avail(PRMG_KEYTAB) < 256 * 4 || safe_avail(PRMG_HNDTAB) < 256 * 4) {
+    if (safe_avail(keytab) < 256 * 4 || safe_avail(hndtab) < 256 * 4) {
         pmc_log("crash", "  [prmg-reg] tables unreadable");
         return;
     }
@@ -410,6 +587,7 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
     CONTEXT *cx = ep->ContextRecord;
     DWORD eip = (DWORD)(ULONG_PTR)er->ExceptionAddress;
+    int full;
 
     int owned = handler_enter(force);
     if (!owned)
@@ -459,30 +637,21 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
                 cls = "mapped but wrong — stale/type-confused pointer or out-of-range index";
         }
         pmc_log("crash", "  -> %s", cls);
-        /* Register correlation: which register held the base pointer? Find the GP
-         * register nearest the fault target within a plausible struct-field span,
-         * so "target = ECX + 0x8" is spelled out instead of left to the eye. */
-        {
-            const DWORD regs[7] = { cx->Eax, cx->Ecx, cx->Edx, cx->Ebx,
-                                    cx->Esi, cx->Edi, cx->Ebp };
-            const char *names[7] = { "EAX", "ECX", "EDX", "EBX", "ESI", "EDI", "EBP" };
-            int best = -1; long bestd = 0x7FFFFFFF; int r;
-            for (r = 0; r < 7; r++) {
-                long d = (long)(tgt - regs[r]);
-                long ad = d < 0 ? -d : d;
-                if (ad <= 0x4000 && ad < (bestd < 0 ? -bestd : bestd)) { best = r; bestd = d; }
-            }
-            if (best >= 0)
-                pmc_log("crash", "  -> faulting pointer = %s(%08lX) %c 0x%lX%s",
-                        names[best], regs[best], bestd < 0 ? '-' : '+',
-                        bestd < 0 ? -bestd : bestd,
-                        regs[best] < 0x00010000UL ? "   [base register is itself near-NULL]" : "");
-        }
+        log_fault_operand(eip, cx, tgt);
     }
+    log_thread();
     pmc_log("crash", "  EAX=%08lX ECX=%08lX EDX=%08lX EBX=%08lX",
             cx->Eax, cx->Ecx, cx->Edx, cx->Ebx);
     pmc_log("crash", "  ESP=%08lX EBP=%08lX ESI=%08lX EDI=%08lX",
             cx->Esp, cx->Ebp, cx->Esi, cx->Edi);
+
+    /* The full record: the address space, the pool and the raw stack. Fatal faults get it, and so does a
+     * first-chance access violation in the game's own .text, in case nothing later reports the fault. The
+     * wrapped exe faults on purpose dozens of times at startup, in SecuROM's sections and in ntdll, and
+     * survives every one: that code is timing-sensitive and those faults stay light. */
+    full = force || (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && eip >= g_textLo && eip < g_textHi);
+    if (full)
+        PmcVmLogSample("crash", "  vmem");
 
     /* Shallow stack walk: return addresses just above ESP that land in an
      * application module (the exe OR a loaded .asi / game-dir dll). Resolving via
@@ -494,18 +663,19 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
      * on the guard page. */
     if (er->ExceptionCode != EXCEPTION_STACK_OVERFLOW) {
         const DWORD *sp = (const DWORD *)cx->Esp;
+        DWORD avail = safe_avail(cx->Esp) / 4;
         int i, found = 0;
-        for (i = 0; i < 160 && found < 24; i++) {
+        for (i = 0; i < 1024 && (DWORD)i < avail && found < 48; i++) {
             DWORD v = sp[i];
             char m[128];
             if (force) {
                 if (resolve_addr(v, m, sizeof(m)) == 1) {
-                    pmc_log("crash", "  stk+%03X = %08lX  %s", i * 4, v, m);
+                    pmc_log("crash", "  stk+%03X = %08lX%s  %s", i * 4, v, call_mark(v), m);
                     found++;
                 }
-            } else if (v >= 0x00401000UL && v < 0x00C00000UL) {
-                /* first-chance: exe-range check only (v0.4.1) — no loader-lock resolve */
-                pmc_log("crash", "  stk+%03X = %08lX", i * 4, v);
+            } else if (in_game_code(v)) {
+                /* first-chance: the exe's own code ranges only — no loader-lock resolve */
+                pmc_log("crash", "  stk+%03X = %08lX%s", i * 4, v, call_mark(v));
                 found++;
             }
         }
@@ -553,13 +723,15 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
         }
     }
 
-    /* Entity post-mortem: find an Entity (first dword == 0xBDB410 vtable) in the
+    /* Entity post-mortem: find an Entity (first dword == the Entity vtable) in the
      * GP registers OR on the stack, and dump up to 3 distinct ones. The GlobalEnter
      * entity-component walk holds the owning entity `this` on the stack, so even
      * when the FAULTING object is a component (e.g. vtable 0xBAA0A0 / 0xA600D4 with
      * a NULL field), the entity that owns it is reachable here. Names the culprit
      * regardless of which leaf of the walk trips — no breakpoint / per-frame cost. */
-    {
+    if (!ENTITY_VTABLE) {
+        pmc_log("crash", "  (sites unresolved on this build: no Entity post-mortem)");
+    } else {
         DWORD seen[3];
         int n_seen = 0, k;
         const DWORD regs[6] = { cx->Eax, cx->Ecx, cx->Edx, cx->Ebx, cx->Esi, cx->Edi };
@@ -586,20 +758,26 @@ static void log_exception(EXCEPTION_POINTERS *ep, const char *via, int force)
             }
         }
         if (n_seen == 0)
-            pmc_log("crash", "  (no Entity vtable 0xBDB410 found in regs/stack)");
+            pmc_log("crash", "  (no Entity vtable %08lX found in regs/stack)", ENTITY_VTABLE);
     }
+
+    if (full)
+        log_pool_stats();
 
     /* Targeted: the 0x4AB26B model-segment spawn-walk (param/model/segment not
      * reachable via the generic Entity scan since the regs are all small ints). */
-    if (eip >= SPAWN_WALK_LO && eip < SPAWN_WALK_HI &&
+    if (PmcSiteHolds(PMC_SITE_SPAWN_WALK, eip) &&
         er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
         dump_spawn_walk(cx);
 
     /* PRMG render-resource registry miss (FUN_0047a6c0 / FUN_0047aa20 family:
      * 0x47A6FB record+0 deref, 0x47AA5C / 0x47A7D8 record+4 / entity loop). */
-    if (eip >= 0x0047A600UL && eip < 0x0047AC00UL &&
+    if ((PmcSiteHolds(PMC_SITE_PRMG_DRAW_A, eip) || PmcSiteHolds(PMC_SITE_PRMG_DRAW_B, eip)) &&
         er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
         dump_prmg_registry(cx);
+
+    if (full && er->ExceptionCode != EXCEPTION_STACK_OVERFLOW)
+        dump_stack_raw(cx->Esp);
 
     pmc_log_flush();
     handler_leave();
@@ -612,17 +790,89 @@ static LONG CALLBACK VehHandler(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;   /* don't alter behavior — just record */
 }
 
-static LONG WINAPI UnhandledFilter(EXCEPTION_POINTERS *ep)
+typedef LONG (WINAPI *UnhandledExceptionFilterFn)(EXCEPTION_POINTERS *);
+static UnhandledExceptionFilterFn g_origUnhandled;
+
+#define CPP_EXCEPTION 0xE06D7363UL
+
+static void record_fatal(EXCEPTION_POINTERS *ep)
 {
     log_exception(ep, "UNHANDLED", 1);  /* fatal/last-chance: ALWAYS log */
-    return EXCEPTION_EXECUTE_HANDLER;   /* terminate; we've recorded it */
+    PmcMinidumpWrite(ep);
 }
 
-void InstallCrashHandler(void)
+/* The installed top-level filter decides first, as the original would have it decide: SecuROM installs
+ * filters of its own, and one that returns CONTINUE_EXECUTION has handled the fault, so nothing is
+ * recorded. It runs from here and is cleared so the original cannot run it twice. The exception is a C++
+ * exception: the game's filter calls terminate() on one and never returns, so that record comes first.
+ * Under a debugger the original does nothing with the filter and neither does this. */
+static LONG WINAPI Hook_UnhandledExceptionFilter(EXCEPTION_POINTERS *ep)
 {
+    LPTOP_LEVEL_EXCEPTION_FILTER filter;
+    LONG verdict = EXCEPTION_CONTINUE_SEARCH;
+    int recorded = 0;
+
+    if (IsDebuggerPresent())
+        return g_origUnhandled(ep);
+
+    if (ep->ExceptionRecord->ExceptionCode == CPP_EXCEPTION) {
+        record_fatal(ep);
+        recorded = 1;
+    }
+    filter = SetUnhandledExceptionFilter(NULL);
+    if (filter)
+        verdict = filter(ep);
+    if (verdict == EXCEPTION_CONTINUE_EXECUTION) {
+        SetUnhandledExceptionFilter(filter);
+        return verdict;
+    }
+    if (!recorded)
+        record_fatal(ep);
+    return verdict == EXCEPTION_EXECUTE_HANDLER ? verdict : g_origUnhandled(ep);
+}
+
+/* The exported function the OS itself calls. ntdll's pointer holds KERNELBASE's copy on every Windows
+ * that has one, so a detour on kernel32's export would never run; kernel32's is the only one before that. */
+static int hook_last_chance(void)
+{
+    HMODULE base = GetModuleHandleA("KERNELBASE.dll");
+    FARPROC target = base ? GetProcAddress(base, "UnhandledExceptionFilter") : NULL;
+    MH_STATUS st;
+
+    if (!target) target = GetProcAddress(GetModuleHandleA("kernel32.dll"), "UnhandledExceptionFilter");
+    if (!target) {
+        pmc_log("crash", "Last-chance hook NOT installed: UnhandledExceptionFilter was not found");
+        return 0;
+    }
+    st = MH_Initialize();
+    if (st == MH_OK || st == MH_ERROR_ALREADY_INITIALIZED)
+        st = MH_CreateHook((LPVOID)target, (LPVOID)Hook_UnhandledExceptionFilter, (LPVOID *)&g_origUnhandled);
+    if (st == MH_OK)
+        st = MH_EnableHook((LPVOID)target);
+    if (st != MH_OK) {
+        pmc_log("crash", "Last-chance hook NOT installed: %s", MH_StatusToString(st));
+        return 0;
+    }
+    return 1;
+}
+
+void InstallCrashHandler(int minidump)
+{
+    capture_code_ranges();
+    g_dllMainTid = GetCurrentThreadId();
+    g_ntQueryThread = (NtQueryInformationThreadFn)GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                                                 "NtQueryInformationThread");
     AddVectoredExceptionHandler(1, VehHandler);   /* 1 = first in the VEH chain */
-    SetUnhandledExceptionFilter(UnhandledFilter);
-    pmc_log("crash", "Crash handler armed (VEH + UnhandledExceptionFilter) — "
-            "faults logged to source [crash].");
+    if (hook_last_chance())
+        pmc_log("crash", "Crash handler armed (VEH + UnhandledExceptionFilter detour) — "
+                "faults logged to source [crash].");
+    else
+        pmc_log("crash", "Crash handler armed for first-chance faults only: no UNHANDLED record will be "
+                "written and no minidump, so a fatal crash cannot be told from a survivable fault.");
+    if (minidump) {
+        if (g_origUnhandled) PmcMinidumpArm();
+    } else {
+        pmc_log("crash", "Minidump on a fatal crash: OFF (set PMC_CRASH_MINIDUMP=1, about 1.5 GB each)");
+    }
     pmc_log_flush();
 }
