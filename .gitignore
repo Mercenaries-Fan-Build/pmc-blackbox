@@ -3,5 +3,6 @@
 *.exp
 *.lib
 pmc_bb*.dll
+pmc_crash_test.exe
 output/
 .DS_Store
