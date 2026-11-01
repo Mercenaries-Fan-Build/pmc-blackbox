@@ -10,7 +10,9 @@ Each feature below belongs to one of three groups — **crack**, **asi**, **log*
 
 - **SecuROM v7 spoof** *(crack)*: Creates the required `v7_XXXX` event so the game can boot without retail media or SecuROM running.
 - **Debug console** *(log)*: Allocates a Windows console window and logs all game output (including Lua prints).
-- **Crash handler** *(log)*: Logs exception info, registers, and call stack on a crash for easier diagnostics.
+- **Crash handler** *(log)*: Logs exception info, registers, the faulting instruction and the operand it used, the faulting thread, the stack, the address space and the game's D3D resource pool on a crash. See [Reading a crash](#reading-a-crash).
+- **Address-space samples** *(log)*: Logs free address space, the largest hole and committed memory every 30 seconds as `[vmem]` lines, plus an `ADDRSPACE laa=<0|1> limit=<hex>` line at startup.
+- **Crash minidump** *(log)*: **Off by default**. Set `PMC_CRASH_MINIDUMP=1` to have a fatal crash write `pmc_crash_<date>_<time>.dmp` to the game folder, about 1.5 GB each.
 - **Lua logging hooks** *(log)*: Captures the game's stripped-out log stream. **Off by default** — the hook detours the game's hot shared log stub and runs per-call stack resolution + formatting on every funneled call, too costly for regular gameplay. Set `PMC_VERBOSE_LOG=1` to install it for a diagnostic run (every line + `@script:line`, plus world-load milestones under the `world` source). Output goes to the console + `pmc_blackbox.log`.
 - **ASI loader** *(asi)*: Discovers and loads all `.asi` plugins from `scripts/`, `plugins/`, `update/`, and the game root — replacing the need for a separate ASI loader DLL.
 - **No loader sniffing** *(asi)*: pmc_bb scans its four search paths and loads what is there. It does not probe for other ASI loaders, read their configs, or inspect the module list — see [Coexisting with other ASI loaders](#coexisting-with-other-asi-loaders).
@@ -42,7 +44,7 @@ There is deliberately **no asi-only build**: plenty of other loaders already do 
 
 **The two builds without the log-stack leave no trace of themselves.** No console, no `pmc_blackbox.log`, and therefore no `BUILD` records and no `LOADER` line. That is the point of a zero-footprint build, but it has a cost: for `crack_only` and `crack_asi` there is nothing for the modkit's debug bundle to collect, and no `BUILD` record naming the variant — because there is no log at all. If you are asking a user to send diagnostics, they need one of the four log builds.
 
-**Dropping the log-stack is what actually shrinks the binary.** It removes `crash_handler.c`, `lua_log_hook.c`, `build_id.c`, `sha256.c` and all of MinHook from the link — roughly 46 KB down to 11 KB. Dropping crack or asi only removes their own code, which is small by comparison.
+**Dropping the log-stack is what actually shrinks the binary.** It removes `crash_handler.c`, `lua_log_hook.c`, `build_id.c`, `sha256.c`, the crash-record sources and all of MinHook from the link — roughly 61 KB down to 11 KB. Dropping crack or asi only removes their own code, which is small by comparison.
 
 ## Coexisting with other ASI loaders
 
@@ -116,6 +118,24 @@ This exists because the question cannot be answered from the binary. A DRM-free 
 **Scope: pmc_bb reports on itself, and only on what it did.** Detecting third-party mod loaders is modkit's job — that is a question about the install directory, which modkit owns and can inspect properly at deploy time.
 
 > **Changed in v0.6.0.** This line used to be `LOADER active=… self=… external=…`, and `self` had a third value, `stood_down`. All of it described the relationship between pmc_bb and some other loader, which the DLL no longer investigates — see [Coexisting with other ASI loaders](#coexisting-with-other-asi-loaders). What remains is the one fact the process cannot be wrong about: did this build scan for plugins.
+
+## Reading a crash
+
+A fault can produce two records:
+
+- `==== VEH EXCEPTION` is first-chance. It appears for every severe fault, including ones something handles and survives, so on its own it doesn't mean the game died. The wrapped exe faults on purpose many times at startup. The `vmem`, `pool` and `raw+` lines appear here only for an access violation in the game's own `.text`.
+- `==== UNHANDLED EXCEPTION` means nothing handled the fault and the process is going down. Module names are resolved only here. It comes from a detour on `UnhandledExceptionFilter`, because the game's CRT startup replaces any filter set from `DllMain` and doesn't chain to it.
+
+Addresses that differ per build are found in the running exe: the `SITE <name>=<hex>` lines at startup. Each site is a byte pattern from `pmc_sites.gen.h`, generated from `mercs2_formats::pmc_sites` in mercs2-wad-simulator, which must match exactly once. On a build they don't fit, a `SITES unresolved` line says why, and the crash record leaves out what needs them.
+
+| Line | What it says |
+|---|---|
+| `-> instruction:`, `-> operand:` | The faulting instruction's bytes, and the registers it addressed through. |
+| `thread= dllmain_thread= start= stack=` | Which thread faulted, and where it started. |
+| `vmem free_kib= largest_kib=` | The address space at the moment of the crash. |
+| `pool textures free= used= ...` | What the D3D resource pool holds, as count/KiB. It never frees a texture. |
+| `stk+NNN = <value> after-call` | A code address on the stack that follows a call. It may be a return address; stale slots pass too. `no-call` rules a value out. |
+| `raw+NNN:` | The stack as hex and ASCII, where asset names in parsers' buffers show up. |
 
 ## Installation
 
