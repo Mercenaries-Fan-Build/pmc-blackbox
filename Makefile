@@ -75,7 +75,8 @@ MINHOOK_SRC  = ./minhook
 # rest is pulled in only by the log variants. MinHook is here rather than in
 # SRCS_QUIET because lua_log_hook.c is its only consumer.
 SRCS_QUIET  = pmc_blackbox.c
-SRCS_LOG    = lua_log_hook.c log_stub.c crash_handler.c build_id.c sha256.c \
+SRCS_LOG    = lua_log_hook.c log_stub.c crash_handler.c fault_decode.c addr_space.c pool_stats.c sites.c \
+              minidump.c build_id.c sha256.c \
               $(MINHOOK_SRC)/hook.c \
               $(MINHOOK_SRC)/buffer.c \
               $(MINHOOK_SRC)/trampoline.c \
@@ -119,7 +120,7 @@ pmc_bb_log_only.dll:     VARIANT_SRCS  = $(SRCS_FULL)
 # behind the `BUILD` records — is kept in portable C and tested natively here.
 CC_HOST    ?= cc
 
-.PHONY: all clean check check-log-stub mingw msvc help $(addsuffix .msvc,$(VARIANTS))
+.PHONY: all clean check check-log-stub check-sites check-pool check-sites-header mingw msvc help $(addsuffix .msvc,$(VARIANTS))
 
 all: $(VARIANTS)
 	@echo ""
@@ -128,11 +129,42 @@ all: $(VARIANTS)
 # Back-compat alias for the old entry point, which built the single default DLL.
 mingw: all
 
-check: sha256.c test_sha256.c sha256.h log_stub.c test_log_stub.c log_stub.h
+check: sha256.c test_sha256.c sha256.h log_stub.c test_log_stub.c log_stub.h \
+       fault_decode.c test_fault_decode.c fault_decode.h addr_space.c test_addr_space.c addr_space.h \
+       sites.c test_sites.c sites.h pmc_sites.gen.h pool_stats.c test_pool_stats.c pool_stats.h
 	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_sha256_test sha256.c test_sha256.c
 	/tmp/pmc_sha256_test
 	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_log_stub_test log_stub.c test_log_stub.c
 	/tmp/pmc_log_stub_test
+	$(CC_HOST) -O2 -Wall -Wextra -D_M_IX86 -o /tmp/pmc_fault_decode_test fault_decode.c test_fault_decode.c $(MINHOOK_SRC)/hde/hde32.c
+	/tmp/pmc_fault_decode_test
+	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_addr_space_test addr_space.c test_addr_space.c
+	/tmp/pmc_addr_space_test
+	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_sites_test sites.c test_sites.c
+	/tmp/pmc_sites_test
+	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_pool_test pool_stats.c test_pool_stats.c
+	/tmp/pmc_pool_test
+
+# The site table against real executables, as <exe>[=<site>:<hex>,...] words:
+#   make check-sites EXES="v11/Mercenaries2.exe=entity_vtable:BDB348 v10/Mercenaries2.exe"
+check-sites: sites.c test_sites.c sites.h pmc_sites.gen.h
+	@test -n "$(EXES)" || { echo "set EXES to executables"; exit 2; }
+	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_sites_test sites.c test_sites.c
+	/tmp/pmc_sites_test $(EXES)
+
+# The pool walk against captured minidumps, as <process.dmp> <texture_free> <texture_in_use> triples:
+#   make check-pool DUMPS="menu/process.dmp 11697cc 1173fe8"
+check-pool: pool_stats.c test_pool_stats.c pool_stats.h pmc_sites.gen.h
+	@test -n "$(DUMPS)" || { echo "set DUMPS to <process.dmp> <texture_free> <texture_in_use> triples"; exit 2; }
+	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_pool_test pool_stats.c test_pool_stats.c
+	/tmp/pmc_pool_test $(DUMPS)
+
+# pmc_sites.gen.h against the table it is generated from, in a mercs2-wad-simulator checkout:
+#   make check-sites-header WAD_SIMULATOR=../mercs2-wad-simulator
+check-sites-header:
+	@test -n "$(WAD_SIMULATOR)" || { echo "set WAD_SIMULATOR to a mercs2-wad-simulator checkout"; exit 2; }
+	cd "$(WAD_SIMULATOR)" && cargo run -q -p mercs2_probe --bin pmc_sites_header > /tmp/pmc_sites.gen.h
+	diff /tmp/pmc_sites.gen.h pmc_sites.gen.h
 
 # The log-stub finder against real executables: pairs of <exe> <expected stub VA>, e.g.
 #   make check-log-stub EXES="v11/Mercenaries2.exe 0x6AEF90 v10/Mercenaries2.exe 0x6D5640"
@@ -151,6 +183,10 @@ $(VARIANTS): $(SRCS_ALL) $(DEF)
 	@printf '\0\0\0\0' | dd of=$@ bs=1 seek=136 count=4 conv=notrunc 2>/dev/null
 	@printf '\0\0\0\0' | dd of=$@ bs=1 seek=216 count=4 conv=notrunc 2>/dev/null
 	@echo "Built: $@ v$(VERSION_STR) ($$(wc -c < $@) bytes) [$(if $(VARIANT_FLAGS),$(VARIANT_FLAGS),all features)]"
+
+# The crash paths on a real Windows or Wine: see test_crash_win.c. Not a published artifact.
+pmc_crash_test.exe: test_crash_win.c
+	$(CC_MINGW) -O0 -Wall -o $@ test_crash_win.c
 
 # --- MSVC (native Windows) ---
 # Same matrix, same target-specific VARIANT_FLAGS/VARIANT_SRCS; `cl` has no
@@ -178,7 +214,7 @@ pmc_bb_log_only.dll.msvc:     VARIANT_FLAGS = -DPMC_DISABLE_SECUROM_EVENT -DPMC_
 pmc_bb_log_only.dll.msvc:     VARIANT_SRCS  = $(SRCS_FULL)
 
 clean:
-	rm -f $(VARIANTS) pmc_bb.dll pmc_bb_log.dll \
+	rm -f $(VARIANTS) pmc_bb.dll pmc_bb_log.dll pmc_crash_test.exe \
 	      pmc_blackbox.obj pmc_blackbox.exp pmc_blackbox.lib *.o
 
 help:
@@ -188,6 +224,9 @@ help:
 	@echo "  make msvc     — Compile all six with MSVC (Windows, not reproducible)"
 	@echo "  make check    — Host-native tests: the SHA-256 behind the BUILD records, the log-stub finder"
 	@echo "  make check-log-stub EXES=\"<exe> <va> ...\" — the log-stub finder against real executables"
+	@echo "  make check-sites EXES=\"<exe>[=<site>:<hex>,...] ...\" — the site table against real executables"
+	@echo "  make check-pool DUMPS=\"<dmp> <free> <in-use> ...\" — the pool walk against captured minidumps"
+	@echo "  make check-sites-header WAD_SIMULATOR=<dir> — pmc_sites.gen.h against its generator"
 	@echo "  make clean    — Remove build artifacts"
 	@echo ""
 	@echo "Variants (crack = SecuROM spoof, asi = ASI loader, log = log-stack):"
