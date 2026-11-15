@@ -75,7 +75,7 @@ MINHOOK_SRC  = ./minhook
 # rest is pulled in only by the log variants. MinHook is here rather than in
 # SRCS_QUIET because lua_log_hook.c is its only consumer.
 SRCS_QUIET  = pmc_blackbox.c
-SRCS_LOG    = lua_log_hook.c log_stub.c crash_handler.c fault_decode.c addr_space.c pool_stats.c sites.c \
+SRCS_LOG    = lua_log_hook.c log_stub.c qm_fatal.c crash_handler.c fault_decode.c addr_space.c pool_stats.c sites.c \
               minidump.c build_id.c sha256.c \
               $(MINHOOK_SRC)/hook.c \
               $(MINHOOK_SRC)/buffer.c \
@@ -131,9 +131,12 @@ mingw: all
 
 check: sha256.c test_sha256.c sha256.h log_stub.c test_log_stub.c log_stub.h \
        fault_decode.c test_fault_decode.c fault_decode.h addr_space.c test_addr_space.c addr_space.h \
-       sites.c test_sites.c sites.h pmc_sites.gen.h pool_stats.c test_pool_stats.c pool_stats.h
+       sites.c test_sites.c sites.h pmc_sites.gen.h pool_stats.c test_pool_stats.c pool_stats.h \
+       qm_fatal.c test_qm_fatal.c qm_fatal.h
 	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_sha256_test sha256.c test_sha256.c
 	/tmp/pmc_sha256_test
+	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_qm_fatal_test qm_fatal.c test_qm_fatal.c
+	/tmp/pmc_qm_fatal_test
 	$(CC_HOST) -O2 -Wall -Wextra -o /tmp/pmc_log_stub_test log_stub.c test_log_stub.c
 	/tmp/pmc_log_stub_test
 	$(CC_HOST) -O2 -Wall -Wextra -D_M_IX86 -o /tmp/pmc_fault_decode_test fault_decode.c test_fault_decode.c $(MINHOOK_SRC)/hde/hde32.c

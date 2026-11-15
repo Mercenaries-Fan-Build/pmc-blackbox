@@ -23,6 +23,7 @@
 
 #include "lua_log_hook.h"
 #include "log_stub.h"
+#include "qm_fatal.h"
 #include "MinHook.h"
 
 /* pmc_log / pmc_log_flush are exported from pmc_blackbox.c (same DLL). */
@@ -45,6 +46,9 @@ extern void pmc_log_flush(void);
  * 13x 0xCC padding, next function at 0x006D5650, verified live). v1.1 code:
  * 0x006AEF90. */
 static DWORD g_stubVA = 0;
+
+/* Whether every line is captured (PMC_VERBOSE_LOG), or only qm's no-dialog failure line watched for. */
+static int g_capture = 0;
 
 static BOOL PtrReadable(const void *p, SIZE_T nbytes);
 
@@ -382,6 +386,19 @@ static int Hook_LogPrintf(lua_State *L) {
     }
     if (!ResolvePrintStack(L, &top, &base, &nargs) || nargs < 1) return 0;
 
+    /* Watch only (no PMC_VERBOSE_LOG): nothing is formatted or logged. The first argument is read
+     * only far enough to tell whether it is qm's no-dialog failure line, and only that line is
+     * copied whole and acted on (qm_fatal.h). */
+    if (!g_capture) {
+        char head[sizeof(QM_FATAL_PREFIX)];
+        if (base->tt != LUA_TSTRING) return 0;
+        if (SafeCopyTString(base->value, head, (int)sizeof(head)) != (int)sizeof(head) - 1) return 0;
+        if (memcmp(head, QM_FATAL_PREFIX, sizeof(head) - 1) != 0) return 0;
+        SafeCopyTString(base->value, buf, (int)sizeof(buf));
+        if (QmFatalText(buf)) QmFatalStop(buf);
+        return 0;
+    }
+
     /* Re-entrancy guard: a logged line must never trigger another logged line. */
     if (InterlockedCompareExchange(&g_inPrintHook, 1, 0) != 0) return 0;
 
@@ -454,6 +471,8 @@ static int Hook_LogPrintf(lua_State *L) {
     pmc_log("lua", "%s", buf);
     /* Echo world-load milestones under the "world" source so they're greppable. */
     MaybeTagMilestone(buf);
+    /* qm's no-dialog failure line stops the game here too (qm_fatal.h). */
+    if (QmFatalText(buf)) QmFatalStop(buf);
 
     InterlockedExchange(&g_inPrintHook, 0);
     return 0; /* print/Debug.Printf push no results */
@@ -474,21 +493,22 @@ static int Hook_LogPrintf(lua_State *L) {
 
 static lua_CFunction g_origStub = NULL;  /* MinHook trampoline (unused no-op) */
 
-int InstallLuaLogHook(void) {
+int InstallLuaLogHook(int capture) {
     MH_STATUS st;
     LogStubSection text, rdata;
     uint32_t stub = 0, row = 0;
     char why[256];
 
+    g_capture = capture;
     if (!ImageSection(".text", &text) || !ImageSection(".rdata", &rdata)) {
-        pmc_log("lualog", "Stripped-log capture NOT installed: the game image has no "
-                "readable .text or .rdata section");
+        pmc_log("lualog", "Stripped-log hook NOT installed (no capture, no qm failure watch): "
+                "the game image has no readable .text or .rdata section");
         pmc_log_flush();
         return 0;
     }
     if (!FindLogStub(&text, &rdata, &stub, &row, why, sizeof(why))) {
-        pmc_log("lualog", "Stripped-log capture NOT installed: the shared log stub was "
-                "not found in this build: %s", why);
+        pmc_log("lualog", "Stripped-log hook NOT installed (no capture, no qm failure watch): "
+                "the shared log stub was not found in this build: %s", why);
         pmc_log_flush();
         return 0;
     }
@@ -520,10 +540,17 @@ int InstallLuaLogHook(void) {
         return 0;
     }
 
-    pmc_log("lualog", "Stripped-log capture installed: MinHook @0x%08X (shared "
-            "print/Debug.Printf/subsystem stub, from the base library's print row "
-            "at 0x%08X). Watch sources [lua]/[world].",
-            (unsigned)g_stubVA, (unsigned)row);
+    if (capture) {
+        pmc_log("lualog", "Stripped-log capture installed: MinHook @0x%08X (shared "
+                "print/Debug.Printf/subsystem stub, from the base library's print row "
+                "at 0x%08X). Watch sources [lua]/[world].",
+                (unsigned)g_stubVA, (unsigned)row);
+    } else {
+        pmc_log("lualog", "Stripped-log watch installed: MinHook @0x%08X (from the base "
+                "library's print row at 0x%08X). It logs nothing but acts on qm's "
+                "\"" QM_FATAL_PREFIX "\" line; set PMC_VERBOSE_LOG=1 to capture the game log.",
+                (unsigned)g_stubVA, (unsigned)row);
+    }
     pmc_log_flush();  /* crash-survivable: this line on disk == install completed */
     return 1;
 }

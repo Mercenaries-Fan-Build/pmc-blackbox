@@ -22,12 +22,15 @@
  * Call once from DllMain AFTER InstallCompatHooks() (MinHook init + pmc_log)
  * and BEFORE LoadASIPlugins(). No .rdata writes.
  *
- * The hook detours the game's hot shared log stub and runs per-call stack
- * resolution + formatting on every funneled call, so it is installed ONLY for a
- * diagnostic run (the caller gates this behind PMC_VERBOSE_LOG). Every captured
- * line is emitted with its @script:line location; world-load milestones are also
- * echoed under the "world" source.
+ * `capture` (PMC_VERBOSE_LOG) chooses what the hook does on each funneled call:
+ *   - capture: per-call stack resolution + formatting; every line is emitted
+ *     with its @script:line location, and world-load milestones are also echoed
+ *     under the "world" source. A diagnostic run.
+ *   - watch (every other run): nothing is formatted or logged; the first
+ *     argument is read only far enough to recognize the Quartermaster's
+ *     no-dialog failure line (qm_fatal.h).
+ * Both act on that failure line: pmc_bb shows it in a message box and exits.
  *
  * Returns 1 on success, 0 on failure (logged).
  */
-int InstallLuaLogHook(void);
+int InstallLuaLogHook(int capture);

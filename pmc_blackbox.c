@@ -158,12 +158,9 @@ static void InitLogFile(void) {
  *
  * ASI plugins resolve this at runtime via GetProcAddress("pmc_log").
  */
-__declspec(dllexport) void pmc_log(const char *source, const char *fmt, ...) {
+static void LogLine(BOOL wait, const char *source, const char *fmt, va_list ap) {
     char msg[1024];
-    va_list ap;
-    va_start(ap, fmt);
     wvsprintfA(msg, fmt, ap);
-    va_end(ap);
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -175,9 +172,12 @@ __declspec(dllexport) void pmc_log(const char *source, const char *fmt, ...) {
     /*
      * Use TryEnterCriticalSection so callers on latency-sensitive threads
      * (D3D9 rendering, audio) never block.  Dropped messages are counted
-     * via g_logDropped and reported at shutdown.
+     * via g_logDropped and reported at shutdown. A caller that must not lose
+     * its line (pmc_log_wait) waits for the lock instead.
      */
-    if (!TryEnterCriticalSection(&g_logLock)) {
+    if (wait) {
+        EnterCriticalSection(&g_logLock);
+    } else if (!TryEnterCriticalSection(&g_logLock)) {
         InterlockedIncrement(&g_logDropped);
         return;
     }
@@ -194,6 +194,23 @@ __declspec(dllexport) void pmc_log(const char *source, const char *fmt, ...) {
     }
 
     LeaveCriticalSection(&g_logLock);
+}
+
+__declspec(dllexport) void pmc_log(const char *source, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    LogLine(FALSE, source, fmt, ap);
+    va_end(ap);
+}
+
+/* pmc_log for a line that must reach the log: it waits for the lock rather than
+ * dropping the line. For pmc_bb's own rare, terminal lines (qm_fatal.c), never a
+ * hot path. Not exported. */
+void pmc_log_wait(const char *source, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    LogLine(TRUE, source, fmt, ap);
+    va_end(ap);
 }
 
 __declspec(dllexport) void pmc_log_flush(void) {
@@ -417,10 +434,10 @@ __declspec(dllexport) int __stdcall BlackboxEntry(void) {
 /* Whether the modkit asked for a diagnostic: any value other than
  * unset/empty/"0"/"false"/"no" counts as enabled.
  *
- * PMC_VERBOSE_LOG: the Lua/engine log hook detours the game's hot shared log stub
- * and runs per-call stack resolution + formatting on every funneled call, which
- * is too costly for regular gameplay — so the hook is NOT installed at all unless
- * it is set (the stub then stays a no-op and costs nothing).
+ * PMC_VERBOSE_LOG: the Lua/engine log hook detours the game's hot shared log stub;
+ * full capture runs per-call stack resolution + formatting on every funneled
+ * call, which is too costly for regular gameplay — so without it the hook only
+ * watches for the Quartermaster's failure line (lua_log_hook.h).
  *
  * PMC_CRASH_MINIDUMP: a dump is about 1.5 GB, so only a run that asks gets one.
  *
@@ -476,17 +493,14 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
          * syscalls) + per-arg formatting BEFORE anything is (or isn't) emitted —
          * far too costly to leave on that hot stub during normal gameplay.
          *
-         * So the ENTIRE hook is gated behind PMC_VERBOSE_LOG: unset = not
-         * installed at all, the stub stays a no-op and costs nothing (the 3.0
-         * default); set = installed for a full-capture diagnostic run. The crash
-         * handler above is always armed regardless. */
+         * So the full capture is gated behind PMC_VERBOSE_LOG. Without it the
+         * hook is still installed, in watch mode: it formats and logs nothing,
+         * and reads only enough of a Lua print's first argument to recognize the
+         * Quartermaster's no-dialog failure line, which must stop the game on
+         * every run (qm_fatal.h). The crash handler above is always armed
+         * regardless. */
 #ifndef PMC_DISABLE_LUA_LOG_HOOK
-        if (EnvFlagSet("PMC_VERBOSE_LOG")) {
-            InstallLuaLogHook();
-        } else {
-            pmc_log("blackbox", "Lua log hook: OFF "
-                    "(set PMC_VERBOSE_LOG=1 to capture the game log)");
-        }
+        InstallLuaLogHook(EnvFlagSet("PMC_VERBOSE_LOG"));
 #else
         pmc_log("blackbox", "Lua log hook: DISABLED at build time");
 #endif
